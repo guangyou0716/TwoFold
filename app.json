@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "TwoFold",
+    "slug": "twofold-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.twofold.app"
+    },
+    "android": {
+      "package": "com.twofold.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0B10",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-av",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "TwoFold uses your photo library to let you pin memories to your milestones.",
+          "cameraPermission": "TwoFold uses your camera to capture moments together."
+        }
+      ]
+    ],
+    "extra": {
+      "useEmulators": false,
+      "firebaseApiKey": "",
+      "firebaseAuthDomain": "",
+      "firebaseProjectId": "",
+      "firebaseStorageBucket": "",
+      "firebaseMessagingSenderId": "",
+      "firebaseAppId": ""
+    }
+  }
+
+}
