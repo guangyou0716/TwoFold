@@ -1,11 +1,10 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   StyleSheet,
   Text,
   View,
   TextInput,
   TouchableOpacity,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
   Alert,
@@ -13,13 +12,15 @@ import {
   Share,
   ScrollView
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import * as Clipboard from "expo-clipboard";
-import { writeBatch, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
+import { writeBatch, doc, getDoc, setDoc, onSnapshot, runTransaction } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import { auth, db } from "../../firebaseConfig";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types";
+import { translations } from "../utils/translations";
 
 type PairingScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, "Pairing">;
@@ -27,10 +28,28 @@ type PairingScreenProps = {
 
 export default function PairingScreen({ navigation }: PairingScreenProps) {
   const currentUser = auth.currentUser;
+  const [languagePreference, setLanguagePreference] = useState<"en" | "zh">("en");
   const [partnerCode, setPartnerCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Load language preference
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsub = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
+      const data = snap.data();
+      if (data?.languagePreference) {
+        setLanguagePreference(data.languagePreference as "en" | "zh");
+      }
+    });
+    return unsub;
+  }, [currentUser]);
+
+  const lang = languagePreference;
+  const t = useCallback((key: keyof typeof translations.en) => {
+    return translations[lang][key] || translations.en[key];
+  }, [lang]);
 
   // Cleanup any pending timeouts on unmount
   useEffect(() => {
@@ -61,8 +80,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
     if (!currentUser) return;
     try {
       await Share.share({
-        message: `Join me on TwoFold! Use my invite code to connect:\n\n${currentUser.uid}\n\nDownload TwoFold and paste this code to link our accounts.`,
-        title: "Join me on TwoFold",
+        message: t("pairShareMsg").replace("{code}", currentUser.uid),
+        title: t("pairShareTitle"),
       });
     } catch {
       // Share cancelled or failed — no action needed
@@ -74,55 +93,114 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
     const cleanedCode = partnerCode.trim();
 
     if (!cleanedCode) {
-      Alert.alert("Missing Code", "Please enter your partner's invite code.");
+      Alert.alert(t("pairInvalidCode"), t("pairPleaseCode"));
       return;
     }
 
     if (cleanedCode === currentUser.uid) {
-      Alert.alert("Oops!", "You cannot pair with yourself! Please enter your partner's code.");
+      Alert.alert(t("pairSelfLinking"), t("pairSelfLinkingMsg"));
       return;
     }
 
     setLoading(true);
     try {
-      // 1. Verify partner exists
+      const myDocRef = doc(db, "users", currentUser.uid);
       const partnerDocRef = doc(db, "users", cleanedCode);
-      const partnerSnap = await getDoc(partnerDocRef);
-
-      if (!partnerSnap.exists()) {
-        Alert.alert(
-          "Invalid Code",
-          "No user found with this invite code. Double-check the code and try again."
-        );
-        setLoading(false);
-        return;
-      }
-
-      const partnerData = partnerSnap.data();
-
-      if (partnerData.groupId || partnerData.partnerId) {
-        Alert.alert(
-          "Partner Already Paired",
-          "This user is already linked with someone else. Ask them to un-pair first."
-        );
-        setLoading(false);
-        return;
-      }
-
-      // 2. Generate deterministic group ID
       const sharedGroupId = `group_${currentUser.uid}_${cleanedCode}`;
+      const groupDocRef = doc(db, "groups", sharedGroupId);
 
-      // 3. Atomic batch write — all three documents or none
+      await runTransaction(db, async (transaction) => {
+        // Read both profiles first (all reads must be before writes!)
+        const mySnap = await transaction.get(myDocRef);
+        const partnerSnap = await transaction.get(partnerDocRef);
+
+        if (!mySnap.exists()) {
+          throw new Error("Your profile does not exist.");
+        }
+        if (!partnerSnap.exists()) {
+          throw new Error("PARTNER_NOT_FOUND");
+        }
+
+        const myData = mySnap.data();
+        const partnerData = partnerSnap.data();
+
+        // Check if I am already paired
+        if (myData.groupId || myData.partnerId) {
+          throw new Error("ALREADY_PAIRED_SELF");
+        }
+
+        // Check if partner is already paired
+        if (partnerData.groupId || partnerData.partnerId) {
+          throw new Error("ALREADY_PAIRED_PARTNER");
+        }
+
+        // Write the shared group document
+        transaction.set(groupDocRef, {
+          groupId: sharedGroupId,
+          partnerAId: currentUser.uid,
+          partnerBId: cleanedCode,
+          balances: {
+            [currentUser.uid]: 0,
+            [cleanedCode]: 0,
+          },
+          streaks: {
+            choreStreak: 0,
+            lastChoreDate: null,
+          },
+          createdAt: new Date().toISOString(),
+        });
+
+        // Update both user profiles
+        transaction.update(myDocRef, {
+          partnerId: cleanedCode,
+          groupId: sharedGroupId,
+        });
+
+        transaction.update(partnerDocRef, {
+          partnerId: currentUser.uid,
+          groupId: sharedGroupId,
+        });
+      });
+
+      // RootNavigator will detect the pairing and redirect automatically
+      Alert.alert(
+        t("pairConnectedTitle"),
+        t("pairConnectedMsg")
+      );
+    } catch (error: unknown) {
+      console.error("[Pairing] Error during pairing transaction:", error);
+      if (error instanceof Error) {
+        if (error.message === "PARTNER_NOT_FOUND") {
+          Alert.alert(t("pairInvalidCode"), t("pairPleaseCode"));
+        } else if (error.message === "ALREADY_PAIRED_SELF") {
+          Alert.alert(t("error"), "You are already linked with a partner.");
+        } else if (error.message === "ALREADY_PAIRED_PARTNER") {
+          Alert.alert(t("pairPartnerAlreadyPairedTitle"), t("pairPartnerAlreadyPairedMsg"));
+        } else {
+          Alert.alert(t("pairFailedTitle"), error.message);
+        }
+      } else {
+        Alert.alert(t("pairFailedTitle"), "An unexpected error occurred.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePlaySolo = async () => {
+    if (!currentUser) return;
+    setLoading(true);
+    try {
+      const soloGroupId = `solo_${currentUser.uid}`;
       const batch = writeBatch(db);
 
-      // Create the shared Group document
-      batch.set(doc(db, "groups", sharedGroupId), {
-        groupId: sharedGroupId,
+      // Create a solo group document
+      batch.set(doc(db, "groups", soloGroupId), {
+        groupId: soloGroupId,
         partnerAId: currentUser.uid,
-        partnerBId: cleanedCode,
+        partnerBId: "",
         balances: {
           [currentUser.uid]: 0,
-          [cleanedCode]: 0,
         },
         streaks: {
           choreStreak: 0,
@@ -131,38 +209,31 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
         createdAt: new Date().toISOString(),
       });
 
-      // Update both user documents
+      // Update current user to use the solo group and mark as solo
       batch.update(doc(db, "users", currentUser.uid), {
-        partnerId: cleanedCode,
-        groupId: sharedGroupId,
+        groupId: soloGroupId,
+        partnerId: "",
+        isSolo: true,
       });
 
-      batch.update(doc(db, "users", cleanedCode), {
-        partnerId: currentUser.uid,
-        groupId: sharedGroupId,
-      });
-
-      // Execute atomically
       await batch.commit();
-
-      // RootNavigator will detect the pairing and redirect automatically
       Alert.alert(
-        "Connected! 💕",
-        "You and your partner are now TwoFold. Let's get started!"
+        t("pairSoloWelcomeTitle"),
+        t("pairSoloWelcomeMsg")
       );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "An unexpected error occurred.";
-      Alert.alert("Pairing Failed", message);
+      Alert.alert(t("pairSoloFailedTitle"), message);
     } finally {
       setLoading(false);
     }
   };
 
   const handleLogout = async () => {
-    Alert.alert("Log Out", "Are you sure you want to log out?", [
-      { text: "Cancel", style: "cancel" },
+    Alert.alert(t("logoutConfirmTitle"), t("logoutConfirmMsg"), [
+      { text: t("cancel"), style: "cancel" },
       {
-        text: "Log Out",
+        text: t("settingsLogoutBtn"),
         style: "destructive",
         onPress: async () => {
           try {
@@ -187,17 +258,17 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          <Text style={styles.title}>Connect with Partner</Text>
+          <Text style={styles.title}>{t("pairTitle")}</Text>
           <Text style={styles.subtitle}>
-            Share your invite code with your partner or enter theirs to link your accounts together.
+            {t("pairSubtitle")}
           </Text>
 
           {/* User's Own Invite Code */}
           <View style={styles.codeContainer}>
-            <Text style={styles.codeLabel}>Your Personal Invite Code</Text>
+            <Text style={styles.codeLabel}>{t("pairYourPersonalCode")}</Text>
             <View style={styles.codeBox}>
               <Text style={styles.codeText} numberOfLines={1} ellipsizeMode="middle">
-                {currentUser?.uid ?? "Loading..."}
+                {currentUser?.uid ?? t("pairLoading")}
               </Text>
             </View>
             <View style={styles.codeActions}>
@@ -207,7 +278,7 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
                 activeOpacity={0.7}
               >
                 <Text style={styles.codeActionText}>
-                  {copied ? "✓ Copied!" : "📋 Copy"}
+                  {copied ? (lang === "zh" ? "✓ 已复制！" : "✓ Copied!") : t("pairCopyBtn")}
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -216,7 +287,7 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
                 activeOpacity={0.7}
               >
                 <Text style={[styles.codeActionText, styles.codeActionTextPrimary]}>
-                  🔗 Share Code
+                  {t("pairShareBtn")}
                 </Text>
               </TouchableOpacity>
             </View>
@@ -224,16 +295,16 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
 
           <View style={styles.divider}>
             <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>OR</Text>
+            <Text style={styles.dividerText}>{lang === "zh" ? "或者" : "OR"}</Text>
             <View style={styles.dividerLine} />
           </View>
 
           {/* Enter Partner's Invite Code */}
           <View style={styles.inputContainer}>
-            <Text style={styles.inputLabel}>Enter Partner's Code</Text>
+            <Text style={styles.inputLabel}>{t("pairEnterPartner")}</Text>
             <TextInput
               style={styles.input}
-              placeholder="Paste partner's invite code here"
+              placeholder={t("pairPlaceholder")}
               placeholderTextColor="#606580"
               value={partnerCode}
               onChangeText={setPartnerCode}
@@ -253,8 +324,16 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
             {loading ? (
               <ActivityIndicator color="#ffffff" />
             ) : (
-              <Text style={styles.connectButtonText}>Connect & Start Playing</Text>
+              <Text style={styles.connectButtonText}>{t("pairConnectAndPlayBtn")}</Text>
             )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.soloButton, loading && styles.soloButtonDisabled]}
+            onPress={handlePlaySolo}
+            disabled={loading}
+          >
+            <Text style={styles.soloButtonText}>{t("pairPlaySoloBtn")}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -262,7 +341,7 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
             onPress={handleLogout}
             disabled={loading}
           >
-            <Text style={styles.logoutButtonText}>Log Out</Text>
+            <Text style={styles.logoutButtonText}>{t("logoutConfirmTitle")}</Text>
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -418,5 +497,23 @@ const styles = StyleSheet.create({
     color: "#606580",
     fontSize: 14,
     fontWeight: "600",
+  },
+  soloButton: {
+    height: 56,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.1)",
+    backgroundColor: "transparent",
+  },
+  soloButtonDisabled: {
+    opacity: 0.5,
+  },
+  soloButtonText: {
+    color: "#A0A5C0",
+    fontSize: 16,
+    fontWeight: "700",
   },
 });

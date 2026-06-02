@@ -1,38 +1,71 @@
-import React from "react";
-import { StyleSheet, Text, View, TouchableOpacity, SafeAreaView, ScrollView } from "react-native";
+import React, { useState, useCallback } from "react";
+import { StyleSheet, Text, View, TouchableOpacity, ScrollView } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types";
+import { translations } from "../utils/translations";
 
 type WelcomeScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, "Welcome">;
 };
 
-const FEATURE_CARDS = [
-  {
-    icon: "✅",
-    title: "Real-time Chores",
-    description: "Sync daily tasks instantly. Complete chores, share the load, and earn points together.",
-    accentColor: "rgba(52, 199, 89, 0.08)",
-    borderAccent: "rgba(52, 199, 89, 0.15)",
-  },
-  {
-    icon: "🎁",
-    title: "Reward Economy",
-    description: "Earn points for completing chores. Spend them on custom coupons created by your partner.",
-    accentColor: "rgba(255, 94, 126, 0.08)",
-    borderAccent: "rgba(255, 94, 126, 0.15)",
-  },
-  {
-    icon: "💖",
-    title: "Memory Scrapbooks",
-    description: "Count days since your first date, countdown to your wedding. Pin videos and photo memories.",
-    accentColor: "rgba(90, 120, 255, 0.08)",
-    borderAccent: "rgba(90, 120, 255, 0.15)",
-  },
-];
-
 export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
+  const [lang, setLang] = useState<"en" | "zh">("en");
+  const t = useCallback((key: keyof typeof translations.en) => {
+    return translations[lang][key] || translations.en[key];
+  }, [lang]);
+
+  const FEATURE_CARDS_EN = [
+    {
+      icon: "✅",
+      title: "Smart Reminders",
+      description: "Sync daily tasks instantly. Set custom schedules, toggle all-day lists, and never miss a beat together.",
+      accentColor: "rgba(52, 199, 89, 0.08)",
+      borderAccent: "rgba(52, 199, 89, 0.15)",
+    },
+    {
+      icon: "💰",
+      title: "Shared Finances",
+      description: "Track couple budgets and bills in sync. Filter monthly or yearly usage, and monitor your shared pool.",
+      accentColor: "rgba(255, 94, 126, 0.08)",
+      borderAccent: "rgba(255, 94, 126, 0.15)",
+    },
+    {
+      icon: "💖",
+      title: "Memory Scrapbooks",
+      description: "Celebrate milestones, countdown to special days, and pin photo/video scrapbooks forever.",
+      accentColor: "rgba(90, 120, 255, 0.08)",
+      borderAccent: "rgba(90, 120, 255, 0.15)",
+    },
+  ];
+
+  const FEATURE_CARDS_ZH = [
+    {
+      icon: "✅",
+      title: "智能提醒事项",
+      description: "即时同步日常任务。设置自定义日程，切换全天待办，情侣之间心有灵犀。",
+      accentColor: "rgba(52, 199, 89, 0.08)",
+      borderAccent: "rgba(52, 199, 89, 0.15)",
+    },
+    {
+      icon: "💰",
+      title: "情侣共享财务",
+      description: "实时共享预算和记账单。支持按月度或年度过滤，并动态追踪剩余资产资金池。",
+      accentColor: "rgba(255, 94, 126, 0.08)",
+      borderAccent: "rgba(255, 94, 126, 0.15)",
+    },
+    {
+      icon: "💖",
+      title: "时光记忆相册",
+      description: "共同庆祝每个特殊纪念日，进行倒计时，并永久固定珍贵的照片或视频剪贴簿。",
+      accentColor: "rgba(90, 120, 255, 0.08)",
+      borderAccent: "rgba(90, 120, 255, 0.15)",
+    },
+  ];
+
+  const activeFeatures = lang === "zh" ? FEATURE_CARDS_ZH : FEATURE_CARDS_EN;
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar style="light" />
@@ -40,15 +73,32 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
         contentContainerStyle={styles.scrollContainer}
         showsVerticalScrollIndicator={false}
       >
+        {/* Language Selection Toggle */}
+        <View style={styles.langToggleRow}>
+          <TouchableOpacity 
+            style={[styles.langToggleBtn, lang === "en" && styles.langToggleBtnActive]} 
+            onPress={() => setLang("en")}
+          >
+            <Text style={[styles.langToggleText, lang === "en" && styles.langToggleTextActive]}>EN</Text>
+          </TouchableOpacity>
+          <Text style={styles.langToggleDivider}>|</Text>
+          <TouchableOpacity 
+            style={[styles.langToggleBtn, lang === "zh" && styles.langToggleBtnActive]} 
+            onPress={() => setLang("zh")}
+          >
+            <Text style={[styles.langToggleText, lang === "zh" && styles.langToggleTextActive]}>中文</Text>
+          </TouchableOpacity>
+        </View>
+
         {/* Brand Header */}
         <View style={styles.header}>
-          <Text style={styles.logo}>TwoFold</Text>
-          <Text style={styles.tagline}>Together, in Sync & Play</Text>
+          <Text style={styles.logo}>{t("welcomeTitle")}</Text>
+          <Text style={styles.tagline}>{t("welcomeSubtitle")}</Text>
         </View>
 
         {/* Feature Cards Grid */}
         <View style={styles.cardContainer}>
-          {FEATURE_CARDS.map((card) => (
+          {activeFeatures.map((card) => (
             <View
               key={card.title}
               style={[
@@ -70,18 +120,18 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
         <View style={styles.buttonContainer}>
           <TouchableOpacity
             style={styles.primaryButton}
-            onPress={() => navigation.navigate("Auth", { isSignUp: true })}
+            onPress={() => navigation.navigate("Auth", { isSignUp: true, initialLang: lang })}
             activeOpacity={0.8}
           >
-            <Text style={styles.primaryButtonText}>Get Started Together</Text>
+            <Text style={styles.primaryButtonText}>{t("signUpBtn")}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.secondaryButton}
-            onPress={() => navigation.navigate("Auth", { isSignUp: false })}
+            onPress={() => navigation.navigate("Auth", { isSignUp: false, initialLang: lang })}
             activeOpacity={0.8}
           >
-            <Text style={styles.secondaryButtonText}>I already have an account</Text>
+            <Text style={styles.secondaryButtonText}>{t("authSwitchLogIn")}</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -98,12 +148,41 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     alignItems: "center",
     justifyContent: "space-between",
-    paddingVertical: 40,
+    paddingVertical: 30,
     paddingHorizontal: 24,
+  },
+  langToggleRow: {
+    flexDirection: "row",
+    alignSelf: "flex-end",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.04)",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.06)",
+  },
+  langToggleBtn: {
+    paddingHorizontal: 4,
+  },
+  langToggleBtnActive: {
+    opacity: 1,
+  },
+  langToggleDivider: {
+    color: "rgba(255, 255, 255, 0.15)",
+    marginHorizontal: 6,
+  },
+  langToggleText: {
+    color: "#606580",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  langToggleTextActive: {
+    color: "#FF5E7E",
   },
   header: {
     alignItems: "center",
-    marginTop: 40,
+    marginTop: 20,
   },
   logo: {
     fontSize: 52,
@@ -119,7 +198,7 @@ const styles = StyleSheet.create({
   },
   cardContainer: {
     width: "100%",
-    marginVertical: 40,
+    marginVertical: 30,
     gap: 14,
   },
   card: {
@@ -146,7 +225,7 @@ const styles = StyleSheet.create({
   buttonContainer: {
     width: "100%",
     gap: 12,
-    marginBottom: 20,
+    marginBottom: 10,
   },
   primaryButton: {
     width: "100%",

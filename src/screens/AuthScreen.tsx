@@ -1,17 +1,17 @@
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import {
   StyleSheet,
   Text,
   View,
   TextInput,
   TouchableOpacity,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
   Alert,
   ActivityIndicator,
   ScrollView
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { FirebaseError } from "firebase/app";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
@@ -20,32 +20,55 @@ import { auth, db } from "../../firebaseConfig";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { RouteProp } from "@react-navigation/native";
 import { RootStackParamList } from "../types";
+import { translations } from "../utils/translations";
 
 type AuthScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, "Auth">;
   route: RouteProp<RootStackParamList, "Auth">;
 };
 
-// Map Firebase error codes to friendly messages
-const getFirebaseErrorMessage = (code: string): string => {
-  switch (code) {
-    case "auth/email-already-in-use":
-      return "This email address is already registered. Try logging in instead.";
-    case "auth/invalid-email":
-      return "Please enter a valid email address.";
-    case "auth/wrong-password":
-    case "auth/invalid-credential":
-      return "Incorrect email or password. Please try again.";
-    case "auth/user-not-found":
-      return "No account found with this email. Try signing up!";
-    case "auth/weak-password":
-      return "Your password must be at least 6 characters long.";
-    case "auth/too-many-requests":
-      return "Too many failed attempts. Please try again in a few minutes.";
-    case "auth/network-request-failed":
-      return "Network error. Please check your internet connection.";
-    default:
-      return "An unexpected error occurred. Please try again.";
+// Map Firebase error codes to friendly messages (localized on the fly based on selected language)
+const getFirebaseErrorMessage = (code: string, lang: "en" | "zh"): string => {
+  if (lang === "zh") {
+    switch (code) {
+      case "auth/email-already-in-use":
+        return "该电子邮箱已被注册，请尝试直接登录。";
+      case "auth/invalid-email":
+        return "请输入有效的邮箱地址。";
+      case "auth/wrong-password":
+      case "auth/invalid-credential":
+        return "密码或邮箱错误，请重新输入。";
+      case "auth/user-not-found":
+        return "未找到该邮箱对应的账号，请尝试注册。";
+      case "auth/weak-password":
+        return "你的密码太弱，请至少使用 6 个字符。";
+      case "auth/too-many-requests":
+        return "尝试次数过多，请在几分钟后重试。";
+      case "auth/network-request-failed":
+        return "网络错误，请检查你的网络连接。";
+      default:
+        return "发生未知错误，请重试。";
+    }
+  } else {
+    switch (code) {
+      case "auth/email-already-in-use":
+        return "This email address is already registered. Try logging in instead.";
+      case "auth/invalid-email":
+        return "Please enter a valid email address.";
+      case "auth/wrong-password":
+      case "auth/invalid-credential":
+        return "Incorrect email or password. Please try again.";
+      case "auth/user-not-found":
+        return "No account found with this email. Try signing up!";
+      case "auth/weak-password":
+        return "Your password must be at least 6 characters long.";
+      case "auth/too-many-requests":
+        return "Too many failed attempts. Please try again in a few minutes.";
+      case "auth/network-request-failed":
+        return "Network error. Please check your internet connection.";
+      default:
+        return "An unexpected error occurred. Please try again.";
+    }
   }
 };
 
@@ -55,34 +78,43 @@ const isValidEmail = (email: string): boolean => {
 };
 
 export default function AuthScreen({ navigation, route }: AuthScreenProps) {
-  const { isSignUp: initialIsSignUp } = route.params;
+  const { isSignUp: initialIsSignUp, initialLang } = route.params;
   const [isSignUp, setIsSignUp] = useState(initialIsSignUp);
+  const [lang] = useState<"en" | "zh">(initialLang ?? "en");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
 
+  const t = useCallback((key: keyof typeof translations.en) => {
+    return translations[lang][key] || translations.en[key];
+  }, [lang]);
+
   const handleAuth = async () => {
     // --- Client-side validation ---
     if (isSignUp && !displayName.trim()) {
-      Alert.alert("Missing Name", "Please enter your name.");
+      Alert.alert(t("authMissingName"), t("authPleaseName"));
+      return;
+    }
+    if (isSignUp && displayName.trim().length > 30) {
+      Alert.alert(t("authInvalidName"), t("authNameTooLong"));
       return;
     }
     if (!email.trim()) {
-      Alert.alert("Missing Email", "Please enter your email address.");
+      Alert.alert(t("authMissingEmail"), t("authPleaseEmail"));
       return;
     }
     if (!isValidEmail(email)) {
-      Alert.alert("Invalid Email", "Please enter a valid email address (e.g. you@example.com).");
+      Alert.alert(t("authInvalidEmail"), t("authPleaseValidEmail"));
       return;
     }
     if (!password) {
-      Alert.alert("Missing Password", "Please enter a password.");
+      Alert.alert(t("authMissingPassword"), t("authPleasePassword"));
       return;
     }
     if (password.length < 6) {
-      Alert.alert("Weak Password", "Your password must be at least 6 characters long.");
+      Alert.alert(t("authWeakPassword"), t("authPasswordLength"));
       return;
     }
 
@@ -99,11 +131,8 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
             email: user.email,
             displayName: displayName.trim(),
             createdAt: new Date().toISOString(),
-            moodBattery: {
-              level: 100,
-              status: "Feeling Great! 🌟",
-              updatedAt: new Date().toISOString(),
-            },
+            isNewUser: true,
+            languagePreference: lang,
           });
         } catch (profileError) {
           // Rollback: delete the Auth account if Firestore profile creation fails
@@ -116,7 +145,7 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
       // Navigation is handled automatically by onAuthStateChanged in RootNavigator
     } catch (error) {
       const code = error instanceof FirebaseError ? error.code : "";
-      Alert.alert("Authentication Failed", getFirebaseErrorMessage(code));
+      Alert.alert(t("authFailed"), getFirebaseErrorMessage(code, lang));
     } finally {
       setLoading(false);
     }
@@ -145,19 +174,19 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
         >
           {/* Back Button */}
           <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
-            <Text style={styles.backButtonText}>← Back</Text>
+            <Text style={styles.backButtonText}>{t("back")}</Text>
           </TouchableOpacity>
 
-          <Text style={styles.title}>{isSignUp ? "Create Account" : "Welcome Back"}</Text>
+          <Text style={styles.title}>{isSignUp ? t("authCreateAccount") : t("authWelcomeBack")}</Text>
           <Text style={styles.subtitle}>
             {isSignUp
-              ? "Start your journey in sync with your partner"
-              : "Sign in to connect with your partner"}
+              ? t("authSignUpSub")
+              : t("authLogInSub")}
           </Text>
 
           {isSignUp && (
             <View style={styles.inputWrapper}>
-              <Text style={styles.label}>Your Name</Text>
+              <Text style={styles.label}>{t("authYourName")}</Text>
               <TextInput
                 style={styles.input}
                 placeholder="Alex"
@@ -167,12 +196,13 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
                 autoCapitalize="words"
                 autoComplete="name"
                 returnKeyType="next"
+                maxLength={30}
               />
             </View>
           )}
 
           <View style={styles.inputWrapper}>
-            <Text style={styles.label}>Email Address</Text>
+            <Text style={styles.label}>{t("authEmail")}</Text>
             <TextInput
               style={styles.input}
               placeholder="name@example.com"
@@ -187,7 +217,7 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
           </View>
 
           <View style={styles.inputWrapper}>
-            <Text style={styles.label}>Password</Text>
+            <Text style={styles.label}>{t("authPassword")}</Text>
             <View style={styles.passwordWrapper}>
               <TextInput
                 style={styles.passwordInput}
@@ -220,7 +250,7 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
               <ActivityIndicator color="#ffffff" />
             ) : (
               <Text style={styles.primaryButtonText}>
-                {isSignUp ? "Create Account" : "Log In"}
+                {isSignUp ? t("authCreateAccount") : t("logInBtn")}
               </Text>
             )}
           </TouchableOpacity>
@@ -228,8 +258,8 @@ export default function AuthScreen({ navigation, route }: AuthScreenProps) {
           <TouchableOpacity style={styles.switchButton} onPress={handleSwitchMode}>
             <Text style={styles.switchButtonText}>
               {isSignUp
-                ? "Already have an account? Log In"
-                : "Don't have an account? Sign Up"}
+                ? t("authSwitchLogIn")
+                : t("authSwitchSignUp")}
             </Text>
           </TouchableOpacity>
         </ScrollView>

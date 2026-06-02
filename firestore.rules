@@ -1,0 +1,135 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Helper functions
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+
+    // Returns the authenticated user's own Firestore profile data
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Checks if the requesting user is in the same group as the target groupId
+    function isMemberOfGroup(groupId) {
+      let profile = myProfile();
+      return profile.groupId == groupId;
+    }
+
+    // -------------------------------------------------------------------------
+    // Users Collection: /users/{uid}
+    // - Users can always read and write their OWN profile.
+    // - Users can read their direct partner's profile (for display purposes).
+    //   Partners are verified by checking the requester's own stored partnerId.
+    // -------------------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isSignedIn() && (
+        isOwner(uid) ||
+        myProfile().partnerId == uid
+      );
+      allow create: if isSignedIn() && isOwner(uid);
+      allow update: if isSignedIn() && isOwner(uid);
+      allow delete: if false; // Users cannot delete their own profile
+    }
+
+    // -------------------------------------------------------------------------
+    // Groups Collection: /groups/{groupId}
+    // - Only members of the group (partnerAId or partnerBId) can read/write.
+    // -------------------------------------------------------------------------
+    match /groups/{groupId} {
+      allow read, write: if isSignedIn() && isMemberOfGroup(groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tasks Collection: /tasks/{taskId}
+    // - Only members of the same group can read, create, update, or delete tasks.
+    // - The groupId in the task document must match the user's own groupId.
+    // -------------------------------------------------------------------------
+    match /tasks/{taskId} {
+      allow read: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow create: if isSignedIn() && isMemberOfGroup(request.resource.data.groupId);
+      allow update: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow delete: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Transactions Collection: /transactions/{txId}
+    // - Only group members can read, create, update, or delete transactions.
+    // -------------------------------------------------------------------------
+    match /transactions/{txId} {
+      allow read: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow create: if isSignedIn() && isMemberOfGroup(request.resource.data.groupId);
+      allow update: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow delete: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Milestones Collection: /milestones/{milestoneId}
+    // - Only group members can access milestones.
+    // -------------------------------------------------------------------------
+    match /milestones/{milestoneId} {
+      allow read: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow create: if isSignedIn() && isMemberOfGroup(request.resource.data.groupId);
+      allow update: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow delete: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Memories Collection: /memories/{memoryId}
+    // - Only group members can access memories.
+    // -------------------------------------------------------------------------
+    match /memories/{memoryId} {
+      allow read: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow create: if isSignedIn() && isMemberOfGroup(request.resource.data.groupId);
+      allow update: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow delete: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Savings Goals Collection: /savings_goals/{goalId}
+    // - Only group members can read/write.
+    // -------------------------------------------------------------------------
+    match /savings_goals/{goalId} {
+      allow read: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow create: if isSignedIn() && isMemberOfGroup(request.resource.data.groupId);
+      allow update: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+      allow delete: if isSignedIn() && isMemberOfGroup(resource.data.groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Nudges Collection: /nudges/{nudgeId}
+    // - Only the intended recipient can mark a nudge as read.
+    // - Only authenticated users can create nudges (sender must be themselves).
+    // - Only sender or recipient can read their own nudges.
+    // -------------------------------------------------------------------------
+    match /nudges/{nudgeId} {
+      allow read: if isSignedIn() && (
+        resource.data.senderId == request.auth.uid ||
+        resource.data.recipientId == request.auth.uid
+      );
+      // Sender must be the authenticated user AND recipient must be their actual partner
+      allow create: if isSignedIn() &&
+        request.resource.data.senderId == request.auth.uid &&
+        request.resource.data.recipientId == myProfile().partnerId;
+      allow update: if isSignedIn() &&
+        resource.data.recipientId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Deny all other access by default
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

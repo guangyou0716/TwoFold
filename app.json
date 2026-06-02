@@ -31,17 +31,13 @@
           "photosPermission": "TwoFold uses your photo library to let you pin memories to your milestones.",
           "cameraPermission": "TwoFold uses your camera to capture moments together."
         }
-      ]
+      ],
+      "expo-video",
+      "expo-notifications",
+      "@react-native-community/datetimepicker"
     ],
     "extra": {
-      "useEmulators": false,
-      "firebaseApiKey": "",
-      "firebaseAuthDomain": "",
-      "firebaseProjectId": "",
-      "firebaseStorageBucket": "",
-      "firebaseMessagingSenderId": "",
-      "firebaseAppId": ""
+      "useEmulators": false
     }
   }
-
 }

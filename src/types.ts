@@ -1,9 +1,3 @@
-export interface MoodBattery {
-  level: number;
-  status: string;
-  updatedAt: string;
-}
-
 export interface UserProfile {
   uid: string;
   email: string | null; // Firebase Auth may return null for social sign-ins
@@ -12,8 +6,13 @@ export interface UserProfile {
   partnerId?: string;
   groupId?: string;
   fcmToken?: string;
-  moodBattery?: MoodBattery;
   createdAt: string;
+  isSolo?: boolean;
+  themePreference?: "dark" | "light"; // "dark" by default, can be toggled to "light"
+  currencyPreference?: string; // e.g. "$", "€", "¥", "RM", "NT$"
+  timezoneLocation?: string; // e.g. "device", "Malaysia (UTC+8)"
+  isNewUser?: boolean;
+  languagePreference?: "en" | "zh";
 }
 
 export interface GroupProfile {
@@ -23,10 +22,12 @@ export interface GroupProfile {
   balances: {
     [userId: string]: number; // Points balance per partner
   };
+  budgetBalance?: number; // Shared financial budget balance (monitored on Budget page)
   streaks: {
     choreStreak: number;
     lastChoreDate: string | null; // null = no chore completed yet
   };
+  featuredMilestoneId?: string | null;
   createdAt: string;
 }
 
@@ -35,40 +36,33 @@ export interface Task {
   groupId: string;
   title: string;
   description: string;
-  pointsValue: number;
   createdBy: string;
-  assignedTo?: string;
+  dueDate: string; // YYYY-MM-DD format (selected by calendar)
+  dueTime?: string; // HH:MM
+  isAllDay: boolean;
+  remindTiming: "at_time" | "1_hour_before" | "1_day_before" | "2_days_before" | "1_week_before" | "none";
   status: "pending" | "completed";
   completedBy?: string;
-  dueDate?: string;
-  createdAt: string;
   completedAt?: string;
+  createdAt: string;
+  notificationId?: string | null;
+  recurrence?: "none" | "daily" | "weekly" | "monthly";
 }
 
-export interface Reward {
+export interface Transaction {
   id: string;
   groupId: string;
   title: string;
-  description: string;
-  pointsCost: number;
-  createdBy: string;
-  status: "active" | "archived";
+  amount: number;
+  type: "expense" | "income";
+  category: string;
+  paidBy: string; // userId
+  date: string; // YYYY-MM-DD
   createdAt: string;
+  recurrence?: "none" | "monthly";
+  isTemplate?: boolean; // If true, this is a hotkey template, not a transaction log
+  nextTriggerDate?: string; // For recurring transactions: YYYY-MM-DD
 }
-
-// A coupon that has been purchased by a partner from the Reward Shop
-export interface PurchasedCoupon {
-  id: string;
-  groupId: string;
-  rewardId: string;
-  buyerId: string;
-  title: string;
-  pointsSpent: number;
-  status: "active" | "redeemed"; // redeemed = honored by partner
-  createdAt: string;
-  redeemedAt?: string;
-}
-
 export interface Milestone {
   id: string;
   groupId: string;
@@ -93,16 +87,27 @@ export interface Memory {
 // Type of nudge sent from one partner to another
 export type NudgeType = "hug" | "poke" | "coffee" | "love" | "chore_reminder";
 
+export interface SavingsGoal {
+  id: string;
+  groupId: string;
+  title: string;
+  targetAmount: number;
+  currentAmount: number;
+  targetDate?: string | null; // YYYY-MM-DD (optional)
+  createdAt: string;
+}
+
 // Navigation Param Lists
 export type RootStackParamList = {
   Welcome: undefined;
-  Auth: { isSignUp: boolean };
+  Auth: { isSignUp: boolean; initialLang?: "en" | "zh" };
   Pairing: undefined;
   HomeTabs: undefined;
 };
 
 export type HomeTabParamList = {
   Dashboard: undefined;
-  RewardShop: undefined;
+  Budget: undefined;
   MemoryCapsule: undefined;
+  Settings: undefined;
 };

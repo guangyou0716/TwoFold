@@ -1,25 +1,24 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
-// @ts-ignore – getReactNativePersistence is exported but typedefs lag behind in firebase JS SDK
+// @ts-expect-error – getReactNativePersistence is exported but typedefs lag behind in firebase JS SDK
 import { initializeAuth, getAuth, getReactNativePersistence, connectAuthEmulator } from "firebase/auth";
 import { getFirestore, connectFirestoreEmulator } from "firebase/firestore";
 import { getStorage, connectStorageEmulator } from "firebase/storage";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
-import Constants from "expo-constants";
 
 // ---------------------------------------------------------------------------
-// Firebase Config — loaded from Expo extra / environment variables
-// Set these in app.json under expo.extra, or via .env.local with EXPO_PUBLIC_ prefix
+// Firebase Config — loaded from EXPO_PUBLIC_ environment variables.
+// Set these in your .env.local file (which is gitignored).
+// DO NOT hardcode credentials here.
 // ---------------------------------------------------------------------------
-const extra = Constants.expoConfig?.extra ?? {};
-
 const firebaseConfig = {
-  apiKey:            extra.firebaseApiKey            ?? "REPLACE_ME_FIREBASE_API_KEY",
-  authDomain:        extra.firebaseAuthDomain        ?? "REPLACE_ME.firebaseapp.com",
-  projectId:         extra.firebaseProjectId         ?? "REPLACE_ME_PROJECT_ID",
-  storageBucket:     extra.firebaseStorageBucket     ?? "REPLACE_ME.appspot.com",
-  messagingSenderId: extra.firebaseMessagingSenderId ?? "REPLACE_ME_SENDER_ID",
-  appId:             extra.firebaseAppId             ?? "REPLACE_ME_APP_ID",
+  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY!,
+  authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+  projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID!,
+  storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+  appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID!,
+  measurementId: process.env.EXPO_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,8 +43,7 @@ const storage = getStorage(app);
 // Local Firebase Emulator Suite
 // ---------------------------------------------------------------------------
 const USE_EMULATORS: boolean =
-  (extra.useEmulators ?? process.env.EXPO_PUBLIC_USE_EMULATORS) === true ||
-  (extra.useEmulators ?? process.env.EXPO_PUBLIC_USE_EMULATORS) === "true";
+  process.env.EXPO_PUBLIC_USE_EMULATORS === "true";
 
 // Module-level flag ensures emulators are only connected once even on hot reload
 let emulatorsConnected = false;

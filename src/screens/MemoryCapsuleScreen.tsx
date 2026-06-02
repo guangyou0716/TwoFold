@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   StyleSheet,
   Text,
@@ -9,35 +9,61 @@ import {
   Modal,
   Alert,
   Image,
-  SafeAreaView,
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
-import { Video, ResizeMode } from "expo-av";
-import { doc, onSnapshot, collection, addDoc, query, where } from "firebase/firestore";
+import { useVideoPlayer, VideoView } from "expo-video";
+import DateTimePicker from "@react-native-community/datetimepicker";
+import { doc, onSnapshot, collection, addDoc, query, where, updateDoc, deleteDoc } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { auth, db, storage } from "../../firebaseConfig";
 import { Milestone, Memory, UserProfile } from "../types";
+import { translations } from "../utils/translations";
+
 
 // Maximum upload sizes
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;  // 5 MB
 const MAX_VIDEO_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+
+// A sub-component to handle dynamic video player hooks in lists
+function VideoMemoryPlayer({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri, (playerInstance) => {
+    playerInstance.loop = false;
+  });
+
+  return (
+    <VideoView
+      style={styles.memoryVideo}
+      player={player}
+      allowsFullscreen
+      allowsPictureInPicture
+    />
+  );
+}
 
 export default function MemoryCapsuleScreen() {
   const currentUser = auth.currentUser;
 
   // State
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const lang = userProfile?.languagePreference ?? "en";
+  const t = useCallback((key: keyof typeof translations.en) => {
+    return translations[lang][key] || translations.en[key];
+  }, [lang]);
+
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [activeMilestoneId, setActiveMilestoneId] = useState<string | null>(null);
   const [memories, setMemories] = useState<Memory[]>([]);
 
   // Milestone creation
+  const [editingMilestone, setEditingMilestone] = useState<Milestone | null>(null);
   const [milestoneModalVisible, setMilestoneModalVisible] = useState(false);
   const [newMTitle, setNewMTitle] = useState("");
-  const [newMDate, setNewMDate] = useState("");
+  const [newMDate, setNewMDate] = useState<Date>(new Date());
+  const [showDatePicker, setShowDatePicker] = useState(false);
   const [isCountdown, setIsCountdown] = useState(false);
 
   // Memory creation
@@ -47,8 +73,12 @@ export default function MemoryCapsuleScreen() {
   const [mediaType, setMediaType] = useState<"image" | "video">("image");
   const [uploading, setUploading] = useState(false);
 
+  // Edit Memory Modal
+  const [editMemoryModalVisible, setEditMemoryModalVisible] = useState(false);
+  const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
+  const [editMemoryText, setEditMemoryText] = useState("");
+
   // Use a ref to track if we've auto-selected the first milestone
-  // This prevents the stale closure bug when the snapshot re-fires
   const hasAutoSelectedRef = useRef(false);
 
   // Load user profile
@@ -86,21 +116,28 @@ export default function MemoryCapsuleScreen() {
 
   // Load memories for active milestone
   useEffect(() => {
-    if (!activeMilestoneId) return;
+    if (!activeMilestoneId || !userProfile?.groupId) return;
 
     const q = query(
       collection(db, "memories"),
-      where("milestoneId", "==", activeMilestoneId)
+      where("milestoneId", "==", activeMilestoneId),
+      where("groupId", "==", userProfile.groupId)
     );
-    const unsub = onSnapshot(q, (snap) => {
-      const loaded: Memory[] = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() } as Memory))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      setMemories(loaded);
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const loaded: Memory[] = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() } as Memory))
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        setMemories(loaded);
+      },
+      (err) => {
+        console.error("[MemoryCapsule] Load memories error:", err);
+      }
+    );
 
     return unsub;
-  }, [activeMilestoneId]);
+  }, [activeMilestoneId, userProfile?.groupId]);
 
   // Calculate days between a date string and today
   const calculateDays = (dateStr: string): number => {
@@ -111,72 +148,131 @@ export default function MemoryCapsuleScreen() {
     return Math.floor((today.getTime() - targetDate.getTime()) / (1000 * 60 * 60 * 24));
   };
 
-  const handleAddMilestone = async () => {
-    if (!newMTitle.trim()) {
-      Alert.alert("Missing Title", "Please enter a name for this milestone.");
-      return;
+  const getMilestoneValues = (m: Milestone) => {
+    const diffDays = calculateDays(m.date);
+    const absDays = Math.abs(diffDays);
+    
+    if (diffDays === 0) {
+      return {
+        countText: lang === "zh" ? "今天！🎂" : "Today! 🎂",
+        labelText: ""
+      };
     }
-    if (!newMDate.trim()) {
-      Alert.alert("Missing Date", "Please enter a date in YYYY-MM-DD format.");
-      return;
-    }
+    
+    const labelText = m.isCountdown
+      ? diffDays < 0
+        ? (lang === "zh" ? "剩余" : "to go")
+        : (lang === "zh" ? "以前" : "ago")
+      : (lang === "zh" ? "相伴" : "together");
+      
+    const years = Math.floor(absDays / 365);
+    const days = absDays % 365;
+    
+    const countText = lang === "zh"
+      ? `${years > 0 ? years + "年" : ""}${days}天`
+      : years > 0 
+        ? `${years} yr${years > 1 ? "s" : ""} ${days} d${days !== 1 ? "s" : ""}`
+        : `${days} day${days !== 1 ? "s" : ""}`;
+      
+    return {
+      countText,
+      labelText
+    };
+  };
 
-    // Validate date format to prevent RangeError crash
-    const parsedDate = new Date(newMDate.trim());
-    if (isNaN(parsedDate.getTime())) {
-      Alert.alert(
-        "Invalid Date",
-        "Please enter a valid date in YYYY-MM-DD format (e.g. 2025-06-01)."
-      );
+
+  const handleEditMilestone = (item: Milestone) => {
+    setEditingMilestone(item);
+    setNewMTitle(item.title);
+    setNewMDate(new Date(item.date));
+    setIsCountdown(item.isCountdown);
+    setMilestoneModalVisible(true);
+  };
+
+  const handleCloseMilestoneModal = () => {
+    setNewMTitle("");
+    setNewMDate(new Date());
+    setIsCountdown(false);
+    setEditingMilestone(null);
+    setMilestoneModalVisible(false);
+  };
+
+  const handleSaveMilestone = async () => {
+    if (!newMTitle.trim()) {
+      Alert.alert(lang === "zh" ? "缺少标题" : "Missing Title", lang === "zh" ? "请输入里程碑名称。" : "Please enter a name for this milestone.");
       return;
     }
 
     try {
-      const docRef = await addDoc(collection(db, "milestones"), {
-        groupId: userProfile?.groupId,
+      const milestoneData = {
         title: newMTitle.trim(),
-        date: parsedDate.toISOString(),
-        isCountdown: isCountdown,
-        themeColor: "#FF5E7E",
-        createdAt: new Date().toISOString(),
-      });
+        date: newMDate.toISOString(),
+        isCountdown,
+      };
 
-      setNewMTitle("");
-      setNewMDate("");
-      setIsCountdown(false);
-      setMilestoneModalVisible(false);
-      setActiveMilestoneId(docRef.id);
+      if (editingMilestone) {
+        await updateDoc(doc(db, "milestones", editingMilestone.id), milestoneData);
+        Alert.alert(t("success") + " 🎉", lang === "zh" ? "里程碑已成功更新。" : "Milestone updated successfully.");
+      } else {
+        const docRef = await addDoc(collection(db, "milestones"), {
+          ...milestoneData,
+          groupId: userProfile?.groupId ?? "solo",
+          themeColor: "#FF5E7E",
+          createdAt: new Date().toISOString()
+        });
+        setActiveMilestoneId(docRef.id);
+        Alert.alert(t("success") + " 🎉", lang === "zh" ? "里程碑已成功创建。" : "Milestone created successfully.");
+      }
+
+      handleCloseMilestoneModal();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      Alert.alert("Error", msg);
+      Alert.alert(t("budgetFailedSave"), msg);
     }
   };
 
+  const handleDeleteMilestone = (m: Milestone) => {
+    Alert.alert(
+      t("deleteMilestoneTitle"),
+      lang === "zh"
+        ? `确定要永久删除里程碑“${m.title}”吗？这也会将其从您的时间轴中移除。`
+        : `Are you sure you want to permanently delete "${m.title}"? This will also remove the milestone from your timeline.`,
+      [
+        { text: t("cancel"), style: "cancel" },
+        {
+          text: lang === "zh" ? "删除" : "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await deleteDoc(doc(db, "milestones", m.id));
+              if (activeMilestoneId === m.id) {
+                setActiveMilestoneId(null);
+              }
+              handleCloseMilestoneModal();
+              Alert.alert(lang === "zh" ? "已删除" : "Deleted", lang === "zh" ? "里程碑已移除。" : "Milestone removed.");
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : "Unknown error";
+              Alert.alert(t("budgetFailedDelete"), msg);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+
   const handlePickMedia = async (type: "image" | "video") => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Permission Denied", "We need access to your photos to upload memories.");
-      return;
-    }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      // Fixed: MediaTypeOptions is deprecated since expo-image-picker v14+
-      // New API uses string literals "images" | "videos"
-      mediaTypes: type === "image" ? "images" : "videos",
-      allowsEditing: type === "image", // Editing not supported for videos
-      quality: 0.85,
-    });
-
-    if (!result.canceled && result.assets && result.assets.length > 0) {
-      setSelectedMedia(result.assets[0].uri);
-      setMediaType(type);
+    if (lang === "zh") {
+      Alert.alert("即将上线 🚀", "为了节省免费云存储额度，照片/视频媒体上传功能目前已禁用，将在后续开发版本中上线。");
+    } else {
+      Alert.alert("Coming Soon 🚀", "To conserve free cloud storage quotas, photo/video media uploads are currently disabled and will be released in a future development update.");
     }
   };
 
   const handleAddMemory = async () => {
     if (!activeMilestoneId) return;
     if (!newMemText.trim() && !selectedMedia) {
-      Alert.alert("Empty Memory", "Please write a note or select a photo/video.");
+      Alert.alert(t("memEmptyMemory"), t("memPleaseWrite"));
       return;
     }
 
@@ -192,9 +288,15 @@ export default function MemoryCapsuleScreen() {
         const maxLabel = mediaType === "video" ? "50MB" : "5MB";
 
         if (blob.size > maxSize) {
+          const typeLabel = mediaType === "video"
+            ? (lang === "zh" ? "视频" : "video")
+            : (lang === "zh" ? "图片" : "image");
           Alert.alert(
-            "File Too Large",
-            `Please select a ${mediaType} smaller than ${maxLabel}. Current file is ${(blob.size / (1024 * 1024)).toFixed(1)}MB.`
+            t("memFileTooLarge"),
+            t("memLimitMessage")
+              .replace("{type}", typeLabel)
+              .replace("{limit}", maxLabel)
+              .replace("{size}", (blob.size / (1024 * 1024)).toFixed(1))
           );
           setUploading(false);
           return;
@@ -223,42 +325,110 @@ export default function MemoryCapsuleScreen() {
       setMemoryModalVisible(false);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Upload failed";
-      Alert.alert("Upload Failed", msg);
+      Alert.alert(t("memUploadFailed"), msg);
     } finally {
       setUploading(false);
     }
   };
 
+  const handleOpenEditMemory = (memory: Memory) => {
+    setSelectedMemory(memory);
+    setEditMemoryText(memory.textContent);
+    setEditMemoryModalVisible(true);
+  };
+
+  const handleUpdateMemory = async () => {
+    if (!selectedMemory) return;
+    try {
+      await updateDoc(doc(db, "memories", selectedMemory.id), {
+        textContent: editMemoryText.trim()
+      });
+      setEditMemoryModalVisible(false);
+      setSelectedMemory(null);
+      Alert.alert(t("success") + " 🎉", t("memMemoryUpdated"));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      Alert.alert(t("memUpdateFailed"), msg);
+    }
+  };
+
+
+  const handleDeleteMemory = (memoryToDelete?: Memory) => {
+    const target = memoryToDelete || selectedMemory;
+    if (!target) return;
+
+    Alert.alert(
+      lang === "zh" ? "删除记忆？" : "Delete Memory?",
+      lang === "zh" ? "确定要永久删除这条记忆吗？此操作无法撤销。" : "Are you sure you want to permanently delete this memory? This cannot be undone.",
+      [
+        { text: t("cancel"), style: "cancel" },
+        {
+          text: lang === "zh" ? "删除" : "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await deleteDoc(doc(db, "memories", target.id));
+              setEditMemoryModalVisible(false);
+              setSelectedMemory(null);
+              Alert.alert(t("memDeletedTitle"), t("memDeleteSuccess"));
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : "Unknown error";
+              Alert.alert(t("budgetFailedDelete"), msg);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+
   const activeMilestone = milestones.find((m) => m.id === activeMilestoneId);
 
+  // Theme Styling Settings
+  const isDark = userProfile?.themePreference !== "light";
+  const colors = {
+    background: isDark ? "#0A0B10" : "#F8F9FA",
+    card: isDark ? "#131520" : "#FFFFFF",
+    text: isDark ? "#FFFFFF" : "#1A1C29",
+    subtitle: isDark ? "#A0A5C0" : "#606580",
+    border: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)",
+    activeTab: "#FF5E7E",
+    tabBackground: isDark ? "rgba(255,255,255,0.02)" : "rgba(0,0,0,0.02)",
+    inactiveText: isDark ? "#606580" : "#A0A5C0",
+    inputBg: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.02)",
+    inputBorder: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.08)",
+    placeholderText: isDark ? "#606580" : "#A0A5C0",
+  };
+
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
 
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.title}>Memory Scrapbook</Text>
-          <Text style={styles.subtitle}>
-            Celebrate milestones and archive your shared videos, photos, and love notes.
+          <Text style={[styles.title, { color: colors.text }]}>{t("memTitle")}</Text>
+          <Text style={[styles.subtitle, { color: colors.subtitle }]}>
+            {t("memSubtitle")}
           </Text>
         </View>
 
         {/* Milestones */}
         <View style={styles.sectionHeaderRow}>
-          <Text style={styles.sectionTitle}>Our Milestones</Text>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>{t("memOurMilestones")}</Text>
           <TouchableOpacity style={styles.addBtn} onPress={() => setMilestoneModalVisible(true)}>
-            <Text style={styles.addBtnText}>+ Add</Text>
+            <Text style={styles.addBtnText}>{t("memAddBtn")}</Text>
           </TouchableOpacity>
         </View>
 
         {milestones.length === 0 ? (
-          <View style={styles.emptyCard}>
+          <View style={[styles.emptyCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <Text style={styles.emptyEmoji}>💫</Text>
-            <Text style={styles.emptyText}>No milestones yet.</Text>
-            <Text style={styles.emptySub}>
-              Set your first milestone (e.g. "First Date" or "Next Anniversary") to start counting days!
+            <Text style={[styles.emptyText, { color: colors.text }]}>{t("memNoMilestonesTitle")}</Text>
+            <Text style={[styles.emptySub, { color: colors.subtitle }]}>
+              {t("memNoMilestonesSub")}
             </Text>
           </View>
+
         ) : (
           <ScrollView
             horizontal
@@ -267,90 +437,108 @@ export default function MemoryCapsuleScreen() {
             nestedScrollEnabled
           >
             {milestones.map((item) => {
-              const diffDays = calculateDays(item.date);
-              const isPast = diffDays >= 0;
-              const absDays = Math.abs(diffDays);
               const isActive = activeMilestoneId === item.id;
-
-              const dayLabel = item.isCountdown
-                ? diffDays < 0
-                  ? "days to go"
-                  : "days ago"
-                : isPast
-                ? "days together"
-                : "days away";
+              const { countText, labelText } = getMilestoneValues(item);
 
               return (
                 <TouchableOpacity
                   key={item.id}
-                  style={[styles.milestoneCard, isActive && styles.activeMilestoneCard]}
+                  style={[
+                    styles.milestoneCard,
+                    { backgroundColor: colors.card, borderColor: colors.border },
+                    isActive && styles.activeMilestoneCard
+                  ]}
                   onPress={() => setActiveMilestoneId(item.id)}
+                  onLongPress={() => handleEditMilestone(item)}
+                  activeOpacity={0.7}
                 >
-                  <Text style={[styles.mCardTitle, isActive && styles.mCardTitleActive]}>
+                  <Text style={[
+                    styles.mCardTitle,
+                    { color: colors.subtitle },
+                    isActive && styles.mCardTitleActive
+                  ]}>
                     {item.title}
                   </Text>
-                  <Text style={styles.mDaysCount}>{absDays.toLocaleString()}</Text>
-                  <Text style={styles.mDaysLabel}>{dayLabel}</Text>
+                  <Text 
+                    numberOfLines={1} 
+                    adjustsFontSizeToFit 
+                    minimumFontScale={0.5} 
+                    style={[styles.mDaysCount, { color: colors.text }]}
+                  >
+                    {countText}
+                  </Text>
+                  {labelText ? (
+                    <Text style={[styles.mDaysLabel, { color: colors.inactiveText }]}>{labelText}</Text>
+                  ) : null}
                 </TouchableOpacity>
               );
             })}
           </ScrollView>
+        )}
+        {milestones.length > 0 && (
+          <Text style={styles.longPressHint}>
+            {t("memLongPressHint")}
+          </Text>
         )}
 
         {/* Memory Feed for active milestone */}
         {activeMilestoneId && (
           <View style={styles.timelineSection}>
             <View style={styles.sectionHeaderRow}>
-              <Text style={styles.sectionTitle}>
-                {activeMilestone?.title ?? "Capsule"} Feed
+              <Text style={[styles.sectionTitle, { color: colors.text }]}>
+                {activeMilestone?.title ?? (lang === "zh" ? "胶囊" : "Capsule")} {t("memFeed")}
               </Text>
               <TouchableOpacity
                 style={styles.addBtn}
                 onPress={() => setMemoryModalVisible(true)}
               >
-                <Text style={styles.addBtnText}>+ Memory</Text>
+                <Text style={styles.addBtnText}>+ {lang === "zh" ? "记忆" : "Memory"}</Text>
               </TouchableOpacity>
             </View>
 
             {memories.length === 0 ? (
-              <View style={styles.emptyCard}>
+              <View style={[styles.emptyCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
                 <Text style={styles.emptyEmoji}>📸</Text>
-                <Text style={styles.emptyText}>No memories pinned yet.</Text>
-                <Text style={styles.emptySub}>Add your first photo, video, or note!</Text>
+                <Text style={[styles.emptyText, { color: colors.text }]}>{t("memNoMemoriesTitle")}</Text>
+                <Text style={[styles.emptySub, { color: colors.subtitle }]}>{t("memNoMemoriesSub")}</Text>
               </View>
+
             ) : (
               <View style={styles.timelineFeed}>
                 {memories.map((item) => (
-                  <View key={item.id} style={styles.memoryCard}>
+                  <TouchableOpacity
+                    key={item.id}
+                    style={[styles.memoryCard, { backgroundColor: colors.card, borderColor: colors.border }]}
+                    onPress={() => handleOpenEditMemory(item)}
+                    activeOpacity={0.7}
+                  >
                     {/* Image memory */}
                     {item.type === "image" && item.mediaUrl ? (
                       <Image source={{ uri: item.mediaUrl }} style={styles.memoryImage} />
                     ) : null}
 
-                    {/* Video memory — now uses expo-av Video player */}
+                    {/* Video memory — now uses the modern expo-video player */}
                     {item.type === "video" && item.mediaUrl ? (
-                      <Video
-                        source={{ uri: item.mediaUrl }}
-                        style={styles.memoryVideo}
-                        useNativeControls
-                        resizeMode={ResizeMode.COVER}
-                        shouldPlay={false}
-                      />
+                      <VideoMemoryPlayer uri={item.mediaUrl} />
                     ) : null}
 
                     <View style={styles.memoryBody}>
                       {/* Only render text if non-empty */}
                       {item.textContent ? (
-                        <Text style={styles.memoryText}>"{item.textContent}"</Text>
+                        <Text style={[styles.memoryText, { color: colors.text }]}>"{item.textContent}"</Text>
                       ) : null}
-                      <Text style={styles.memoryFooter}>
-                        By {item.uploadedBy === currentUser?.uid ? "You" : "Partner"} ·{" "}
-                        {new Date(item.createdAt).toLocaleDateString()}
+                      <Text style={[styles.memoryFooter, { color: colors.inactiveText }]}>
+                        {item.uploadedBy === currentUser?.uid ? t("memByYou") : t("memByPartner")} ·{" "}
+                        {new Date(item.createdAt).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US")}
                       </Text>
                     </View>
-                  </View>
+                  </TouchableOpacity>
                 ))}
+                <Text style={[styles.hintText, { color: colors.inactiveText, textAlign: "center", marginTop: 8 }]}>
+                  {t("memHintTap")}
+                </Text>
               </View>
+
             )}
           </View>
         )}
@@ -362,58 +550,103 @@ export default function MemoryCapsuleScreen() {
           behavior={Platform.OS === "ios" ? "padding" : "height"}
           style={styles.modalOverlay}
         >
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Add a Milestone</Text>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>{editingMilestone ? t("memEditMilestone") : t("memAddMilestone")}</Text>
 
-            <Text style={styles.modalLabel}>Milestone Name</Text>
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{t("memName")}</Text>
             <TextInput
-              style={styles.modalInput}
-              placeholder="e.g. First Date, Bali Trip, Wedding Day"
-              placeholderTextColor="#606580"
+              style={[styles.modalInput, { backgroundColor: colors.inputBg, borderColor: colors.inputBorder, color: colors.text }]}
+              placeholder={t("memPlaceholderName")}
+              placeholderTextColor={colors.placeholderText}
               value={newMTitle}
               onChangeText={setNewMTitle}
               autoFocus
             />
 
-            <Text style={styles.modalLabel}>Date (YYYY-MM-DD)</Text>
-            <TextInput
-              style={styles.modalInput}
-              placeholder="e.g. 2025-06-01"
-              placeholderTextColor="#606580"
-              value={newMDate}
-              onChangeText={setNewMDate}
-              keyboardType="numbers-and-punctuation"
-            />
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{t("memDate")}</Text>
+            <TouchableOpacity
+              style={[styles.datePickerTrigger, { backgroundColor: colors.inputBg, borderColor: colors.inputBorder }]}
+              onPress={() => setShowDatePicker(true)}
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.datePickerTriggerText, { color: colors.text }]}>
+                📅 {newMDate.toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US", { year: "numeric", month: "long", day: "numeric" })}
+              </Text>
+            </TouchableOpacity>
+
+            {showDatePicker && Platform.OS === "ios" ? (
+              <Modal visible={showDatePicker} transparent animationType="slide">
+                <View style={styles.modalOverlay}>
+                  <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                    <Text style={[styles.modalTitle, { color: colors.text, textAlign: "center" }]}>{t("memSelectDate")}</Text>
+                    <DateTimePicker
+                      value={newMDate}
+                      mode="date"
+                      display="spinner"
+                      themeVariant={isDark ? "dark" : "light"}
+                      textColor={colors.text}
+                      onChange={(event, selectedDate) => {
+                        if (selectedDate) {
+                          setNewMDate(selectedDate);
+                        }
+                      }}
+                    />
+                    <TouchableOpacity
+                      style={[styles.modalSubmit, { marginTop: 16, alignItems: "center" }]}
+                      onPress={() => setShowDatePicker(false)}
+                    >
+                      <Text style={styles.modalSubmitText}>{t("memConfirm")}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </Modal>
+            ) : showDatePicker ? (
+              <DateTimePicker
+                value={newMDate}
+                mode="date"
+                display="default"
+                onChange={(event, selectedDate) => {
+                  setShowDatePicker(false);
+                  if (selectedDate) {
+                    setNewMDate(selectedDate);
+                  }
+                }}
+              />
+            ) : null}
 
             <TouchableOpacity
               style={styles.toggleRow}
               onPress={() => setIsCountdown(!isCountdown)}
             >
-              <Text style={styles.toggleText}>Count down to this date (future event)?</Text>
-              <View style={[styles.toggleBox, isCountdown && styles.toggleBoxActive]}>
+              <Text style={[styles.toggleText, { color: colors.subtitle }]}>{t("memCountdownToggle")}</Text>
+              <View style={[styles.toggleBox, { borderColor: isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)" }, isCountdown && styles.toggleBoxActive]}>
                 <Text style={styles.toggleIndicator}>{isCountdown ? "✓" : ""}</Text>
               </View>
             </TouchableOpacity>
 
             <View style={styles.modalButtons}>
+              {editingMilestone && (
+                <TouchableOpacity
+                  style={[styles.modalDeleteBtn, { marginRight: "auto" }]}
+                  onPress={() => handleDeleteMilestone(editingMilestone)}
+                >
+                  <Text style={styles.modalDeleteText}>{t("memDelete")}</Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity
                 style={styles.modalCancel}
-                onPress={() => {
-                  setNewMTitle("");
-                  setNewMDate("");
-                  setIsCountdown(false);
-                  setMilestoneModalVisible(false);
-                }}
+                onPress={handleCloseMilestoneModal}
               >
-                <Text style={styles.modalCancelText}>Cancel</Text>
+                <Text style={styles.modalCancelText}>{t("cancel")}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.modalSubmit} onPress={handleAddMilestone}>
-                <Text style={styles.modalSubmitText}>Save Milestone</Text>
+              <TouchableOpacity style={styles.modalSubmit} onPress={handleSaveMilestone}>
+                <Text style={styles.modalSubmitText}>{editingMilestone ? (lang === "zh" ? "更新" : "Update") : t("memSaveMilestone")}</Text>
               </TouchableOpacity>
             </View>
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
 
       {/* Add Memory Modal */}
       <Modal visible={memoryModalVisible} animationType="slide" transparent>
@@ -421,48 +654,56 @@ export default function MemoryCapsuleScreen() {
           behavior={Platform.OS === "ios" ? "padding" : "height"}
           style={styles.modalOverlay}
         >
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Pin a Memory</Text>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>{t("memAddMemoryTitle")}</Text>
 
-            <Text style={styles.modalLabel}>Your Note</Text>
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{t("memWriteNote")}</Text>
             <TextInput
-              style={[styles.modalInput, { height: 80, textAlignVertical: "top", paddingTop: 14 }]}
-              placeholder="Write something heartfelt about this moment..."
-              placeholderTextColor="#606580"
+              style={[styles.modalInput, { backgroundColor: colors.inputBg, borderColor: colors.inputBorder, color: colors.text, height: 80, textAlignVertical: "top", paddingTop: 14 }]}
+              placeholder={t("memPlaceholderNote")}
+              placeholderTextColor={colors.placeholderText}
               value={newMemText}
               onChangeText={setNewMemText}
               multiline
               maxLength={500}
             />
 
-            <Text style={styles.modalLabel}>Attach Media (optional)</Text>
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{lang === "zh" ? "添加媒体 (后续开发上线)" : "Attach Media (Future Development)"}</Text>
             <View style={styles.mediaButtonsRow}>
               <TouchableOpacity
-                style={[styles.mediaBtn, mediaType === "image" && selectedMedia && styles.mediaBtnActive]}
+                style={[
+                  styles.mediaBtn,
+                  { backgroundColor: colors.inputBg, borderColor: colors.inputBorder },
+                  mediaType === "image" && selectedMedia && styles.mediaBtnActive
+                ]}
                 onPress={() => handlePickMedia("image")}
               >
-                <Text style={styles.mediaBtnText}>📸 Photo</Text>
+                <Text style={[styles.mediaBtnText, { color: colors.subtitle }, mediaType === "image" && selectedMedia && { color: "#FF5E7E" }]}>{t("memPhoto")}</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.mediaBtn, mediaType === "video" && selectedMedia && styles.mediaBtnActive]}
+                style={[
+                  styles.mediaBtn,
+                  { backgroundColor: colors.inputBg, borderColor: colors.inputBorder },
+                  mediaType === "video" && selectedMedia && styles.mediaBtnActive
+                ]}
                 onPress={() => handlePickMedia("video")}
               >
-                <Text style={styles.mediaBtnText}>📹 Video</Text>
+                <Text style={[styles.mediaBtnText, { color: colors.subtitle }, mediaType === "video" && selectedMedia && { color: "#FF5E7E" }]}>{t("memVideo")}</Text>
               </TouchableOpacity>
             </View>
 
             {selectedMedia && (
               <View style={styles.previewContainer}>
-                <Text style={styles.previewLabel}>✓ Media selected</Text>
+                <Text style={styles.previewLabel}>{t("memMediaSelected")}</Text>
                 {mediaType === "image" ? (
                   <Image source={{ uri: selectedMedia }} style={styles.mediaPreview} />
                 ) : (
-                  <View style={styles.mediaPreviewPlaceholder}>
-                    <Text style={styles.previewIcon}>📹 Video ready to upload</Text>
+                  <View style={[styles.mediaPreviewPlaceholder, { backgroundColor: colors.inputBg, borderColor: colors.inputBorder }]}>
+                    <Text style={[styles.previewIcon, { color: colors.subtitle }]}>{t("memVideoReady")}</Text>
                   </View>
                 )}
                 <TouchableOpacity onPress={() => setSelectedMedia(null)} style={styles.removeMedia}>
-                  <Text style={styles.removeMediaText}>✕ Remove</Text>
+                  <Text style={[styles.removeMediaText, { color: colors.inactiveText }]}>{t("memRemove")}</Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -477,7 +718,7 @@ export default function MemoryCapsuleScreen() {
                 }}
                 disabled={uploading}
               >
-                <Text style={styles.modalCancelText}>Cancel</Text>
+                <Text style={styles.modalCancelText}>{t("cancel")}</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.modalSubmit, uploading && { opacity: 0.7 }]}
@@ -487,16 +728,64 @@ export default function MemoryCapsuleScreen() {
                 {uploading ? (
                   <ActivityIndicator color="#ffffff" />
                 ) : (
-                  <Text style={styles.modalSubmitText}>Pin Memory</Text>
+                  <Text style={styles.modalSubmitText}>{t("memPinBtn")}</Text>
                 )}
               </TouchableOpacity>
             </View>
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+
+      {/* Edit Memory Modal */}
+      <Modal visible={editMemoryModalVisible} animationType="slide" transparent>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalOverlay}
+        >
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>{t("memEditMemory")}</Text>
+
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{t("memWriteNote")}</Text>
+            <TextInput
+              style={[styles.modalInput, { backgroundColor: colors.inputBg, borderColor: colors.inputBorder, color: colors.text, height: 80, textAlignVertical: "top", paddingTop: 14 }]}
+              value={editMemoryText}
+              onChangeText={setEditMemoryText}
+              multiline
+              maxLength={500}
+            />
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={[styles.modalCancel, { marginRight: "auto" }]}
+                onPress={() => handleDeleteMemory()}
+              >
+                <Text style={{ color: "#FF3B30", fontSize: 14, fontWeight: "700" }}>{t("memDelete")}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalCancel}
+                onPress={() => {
+                  setEditMemoryText("");
+                  setSelectedMemory(null);
+                  setEditMemoryModalVisible(false);
+                }}
+              >
+                <Text style={styles.modalCancelText}>{t("cancel")}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSubmit}
+                onPress={handleUpdateMemory}
+              >
+                <Text style={styles.modalSubmitText}>{lang === "zh" ? "保存" : "Save"}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
     </SafeAreaView>
   );
-}
+};
 
 const styles = StyleSheet.create({
   container: {
@@ -809,5 +1098,39 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 14,
     fontWeight: "700",
+  },
+  modalDeleteBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+  },
+  modalDeleteText: {
+    color: "#FF3B30",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  longPressHint: {
+    fontSize: 11,
+    color: "#606580",
+    textAlign: "center",
+    marginTop: 8,
+  },
+  datePickerTrigger: {
+    height: 50,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  datePickerTriggerText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  hintText: {
+    fontSize: 11,
+    color: "#606580",
   },
 });
