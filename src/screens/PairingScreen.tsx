@@ -156,19 +156,20 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
         transaction.update(myDocRef, {
           partnerId: cleanedCode,
           groupId: sharedGroupId,
+          isSolo: false,
         });
 
         transaction.update(partnerDocRef, {
           partnerId: currentUser.uid,
           groupId: sharedGroupId,
+          isSolo: false,
         });
       });
 
-      // RootNavigator will detect the pairing and redirect automatically
-      Alert.alert(
-        t("pairConnectedTitle"),
-        t("pairConnectedMsg")
-      );
+      // RootNavigator will detect the pairing and redirect automatically.
+      // We do not show a blocking native Alert here, as it can deadlock
+      // the screen transition during unmounting.
+      console.info("[Pairing] Successfully connected with partner!");
     } catch (error: unknown) {
       console.error("[Pairing] Error during pairing transaction:", error);
       if (error instanceof Error) {
@@ -219,10 +220,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
       });
 
       await batch.commit();
-      Alert.alert(
-        t("pairSoloWelcomeTitle"),
-        t("pairSoloWelcomeMsg")
-      );
+      // RootNavigator will redirect automatically.
+      console.info("[Pairing] Successfully started Solo Mode!");
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "An unexpected error occurred.";
       Alert.alert(t("pairSoloFailedTitle"), message);

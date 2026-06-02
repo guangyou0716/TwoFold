@@ -31,10 +31,7 @@ service cloud.firestore {
     //   Partners are verified by checking the requester's own stored partnerId.
     // -------------------------------------------------------------------------
     match /users/{uid} {
-      allow read: if isSignedIn() && (
-        isOwner(uid) ||
-        myProfile().partnerId == uid
-      );
+      allow read: if isSignedIn();
       allow create: if isSignedIn() && isOwner(uid);
       allow update: if isSignedIn() && (
         // 1. Owner updates their own profile
@@ -54,7 +51,7 @@ service cloud.firestore {
               // Case C: Connecting with partner
               (request.resource.data.groupId == "group_" + uid + "_" + request.resource.data.partnerId ||
                request.resource.data.groupId == "group_" + request.resource.data.partnerId + "_" + uid) &&
-              (request.resource.data.isSolo == false || !('isSolo' in request.resource.data))
+              (request.resource.data.isSolo == false || request.resource.data.isSolo == true || !('isSolo' in request.resource.data))
             )
           )
         ) ||
@@ -66,10 +63,10 @@ service cloud.firestore {
           request.resource.data.groupId == "" &&
           request.resource.data.isSolo == true
         ) ||
-        // 3. Partner initiates pairing with this user (when this user is unpaired)
+        // 3. Partner initiates pairing with this user (when this user is unpaired or in solo mode)
         (
-          ( !('partnerId' in resource.data) || resource.data.partnerId == "" || !('partnerId' in resource.data) ) &&
-          ( !('groupId' in resource.data) || resource.data.groupId == "" || !('groupId' in resource.data) ) &&
+          ( !('partnerId' in resource.data) || resource.data.partnerId == "" ) &&
+          ( !('groupId' in resource.data) || resource.data.groupId == "" || resource.data.groupId == "solo_" + uid ) &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerId', 'groupId', 'isSolo']) &&
           request.resource.data.partnerId == request.auth.uid &&
           (request.resource.data.groupId == "group_" + request.auth.uid + "_" + uid ||
@@ -84,13 +81,23 @@ service cloud.firestore {
     // - Only members of the group (partnerAId or partnerBId) can read/write.
     // -------------------------------------------------------------------------
     match /groups/{groupId} {
-      allow read, write: if isSignedIn() && (
+      allow read: if isSignedIn() && (
+        isMemberOfGroup(groupId) ||
+        resource.data.partnerAId == request.auth.uid ||
+        resource.data.partnerBId == request.auth.uid
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.partnerAId == request.auth.uid ||
+        request.resource.data.partnerBId == request.auth.uid
+      );
+      allow update: if isSignedIn() && (
         isMemberOfGroup(groupId) ||
         resource.data.partnerAId == request.auth.uid ||
         resource.data.partnerBId == request.auth.uid ||
         request.resource.data.partnerAId == request.auth.uid ||
         request.resource.data.partnerBId == request.auth.uid
       );
+      allow delete: if false;
     }
 
     // -------------------------------------------------------------------------
