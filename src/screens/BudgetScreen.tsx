@@ -115,11 +115,20 @@ export default function BudgetScreen() {
   const [fundsAmount, setFundsAmount] = useState("");
   const [fundsAction, setFundsAction] = useState<"add" | "deduct">("add");
 
+  // Self-healing listener retry trigger for permission-denied race conditions
+  const [retryTrigger, setRetryTrigger] = useState(0);
+
+
   // Load user profile
   useEffect(() => {
     if (!currentUser) return;
     const unsub = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
-      setUserProfile(snap.data() as UserProfile ?? null);
+      const data = snap.data() as UserProfile | undefined;
+      if (data) {
+        setUserProfile(data);
+      }
+    }, (error) => {
+      console.log("[Budget] User profile deleted or unauthorized:", error.message);
     });
     return unsub;
   }, [currentUser]);
@@ -132,6 +141,8 @@ export default function BudgetScreen() {
     }
     const unsub = onSnapshot(doc(db, "users", userProfile.partnerId), (snap) => {
       setPartnerProfile(snap.data() as UserProfile ?? null);
+    }, (error) => {
+      console.log("[Budget] Partner profile deleted or unauthorized:", error.message);
     });
     return unsub;
   }, [userProfile?.partnerId]);
@@ -141,8 +152,18 @@ export default function BudgetScreen() {
     if (!userProfile?.groupId || !currentUser) return;
 
     setLoading(true);
+    let isCleanedUp = false;
+
     const unsubGroup = onSnapshot(doc(db, "groups", userProfile.groupId), (snap) => {
+      if (isCleanedUp) return;
       setGroup(snap.data() as GroupProfile ?? null);
+    }, (error) => {
+      console.log("[Budget] Group listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     const q = query(
@@ -207,6 +228,7 @@ export default function BudgetScreen() {
     };
 
     const unsubTx = onSnapshot(q, async (snap) => {
+      if (isCleanedUp) return;
       const loaded: Transaction[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as Transaction)
       );
@@ -225,6 +247,11 @@ export default function BudgetScreen() {
     }, (err) => {
       console.error("[Budget] Load transactions error:", err);
       setLoading(false);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     const qSavings = query(
@@ -233,6 +260,7 @@ export default function BudgetScreen() {
     );
 
     const unsubSavings = onSnapshot(qSavings, (snap) => {
+      if (isCleanedUp) return;
       const loaded: SavingsGoal[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as SavingsGoal)
       );
@@ -240,14 +268,20 @@ export default function BudgetScreen() {
       setSavingsGoals(loaded);
     }, (err) => {
       console.error("[Budget] Load savings goals error:", err);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     return () => {
+      isCleanedUp = true;
       unsubGroup();
       unsubTx();
       unsubSavings();
     };
-  }, [userProfile?.groupId, currentUser]);
+  }, [userProfile?.groupId, currentUser, retryTrigger]);
 
   // Theme Styling Settings
   const isDark = userProfile?.themePreference !== "light";

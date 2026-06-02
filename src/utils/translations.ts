@@ -31,7 +31,7 @@ export const translations = {
     authMissingPassword: "Missing Password",
     authPleasePassword: "Please enter a password.",
     authWeakPassword: "Weak Password",
-    authPasswordLength: "Your password must be at least 6 characters long.",
+    authPasswordLength: "Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, one number, and one special character.",
     back: "← Back",
 
     // Pairing Screen
@@ -244,10 +244,19 @@ export const translations = {
     settingsConnectedSub: "You share a real-time reminder checklist, a budget log, and a scrapbook together!",
     settingsUnlinkBtn: "⚠️ Unlink from Partner",
     settingsLogoutBtn: "🚪 Log Out Account",
+    settingsChangePassword: "Change Login Password 🔒",
+    settingsNewPassword: "New Password",
+    settingsConfirmPassword: "Confirm New Password",
+    settingsUpdatePasswordBtn: "Update Password",
+    settingsPasswordMismatch: "Passwords do not match.",
+    settingsPasswordUpdated: "Password updated successfully! 🎉",
     settingsLanguage: "🌐 Language Preferences",
     settingsSelectLanguage: "Select Language",
     settingsEnglish: "English 🇺🇸",
     settingsChinese: "Chinese 中文 🇨🇳",
+    settingsExportDataBtn: "📥 Export Personal Data (GDPR)",
+    settingsExportDataTitle: "Export Data backup 📥",
+    settingsDeleteConfirmSub: "⚠️ Permanent Account Deletion (GDPR)",
 
     // Timezones & Categories & Remind Timing Labels
     deviceLocalTime: "Device Local Time 📱",
@@ -334,8 +343,8 @@ export const translations = {
     authPleaseValidEmail: "请输入有效的邮箱地址（例如 you@example.com）。",
     authMissingPassword: "缺少密码",
     authPleasePassword: "请输入密码。",
-    authWeakPassword: "密码太弱",
-    authPasswordLength: "密码长度必须至少为 6 个字符。",
+    authWeakPassword: "密码强度过弱",
+    authPasswordLength: "密码必须至少为 8 个字符，且包含至少一个大写字母、一个小写字母、一个数字和一个特殊字符。",
     back: "← 返回",
 
     // Pairing Screen
@@ -548,10 +557,19 @@ export const translations = {
     settingsConnectedSub: "你们现在正实时共享同一个待办提醒表、共享记账本和剪贴轴！",
     settingsUnlinkBtn: "⚠️ 解除与伴侣的连接",
     settingsLogoutBtn: "🚪 退出登录当前账号",
+    settingsChangePassword: "修改登录密码 🔒",
+    settingsNewPassword: "新密码",
+    settingsConfirmPassword: "确认新密码",
+    settingsUpdatePasswordBtn: "确认修改密码",
+    settingsPasswordMismatch: "两次输入的密码不一致。",
+    settingsPasswordUpdated: "密码修改成功！🎉",
     settingsLanguage: "🌐 多语言偏好选择",
     settingsSelectLanguage: "选择显示语言",
     settingsEnglish: "英文 English 🇺🇸",
     settingsChinese: "中文 Chinese 🇨🇳",
+    settingsExportDataBtn: "📥 导出个人数据备份 (GDPR)",
+    settingsExportDataTitle: "导出数据备份 📥",
+    settingsDeleteConfirmSub: "⚠️ 永久注销账户 (GDPR)",
 
     // Timezones & Categories & Remind Timing Labels
     deviceLocalTime: "手机系统本地时间 📱",

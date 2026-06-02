@@ -81,11 +81,20 @@ export default function MemoryCapsuleScreen() {
   // Use a ref to track if we've auto-selected the first milestone
   const hasAutoSelectedRef = useRef(false);
 
+  // Self-healing listener retry trigger for permission-denied race conditions
+  const [retryTrigger, setRetryTrigger] = useState(0);
+
+
   // Load user profile
   useEffect(() => {
     if (!currentUser) return;
     const unsub = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
-      setUserProfile(snap.data() as UserProfile ?? null);
+      const data = snap.data() as UserProfile | undefined;
+      if (data) {
+        setUserProfile(data);
+      }
+    }, (error) => {
+      console.log("[MemoryCapsule] User profile listener error:", error.message);
     });
     return unsub;
   }, [currentUser]);
@@ -94,11 +103,14 @@ export default function MemoryCapsuleScreen() {
   useEffect(() => {
     if (!userProfile?.groupId) return;
 
+    let isCleanedUp = false;
+
     const q = query(
       collection(db, "milestones"),
       where("groupId", "==", userProfile.groupId)
     );
     const unsub = onSnapshot(q, (snap) => {
+      if (isCleanedUp) return;
       const loaded: Milestone[] = snap.docs
         .map((d) => ({ id: d.id, ...d.data() } as Milestone))
         .sort((a, b) => a.date.localeCompare(b.date)); // Sort by date ascending
@@ -109,14 +121,26 @@ export default function MemoryCapsuleScreen() {
         hasAutoSelectedRef.current = true;
         setActiveMilestoneId(loaded[0].id);
       }
+    }, (error) => {
+      console.log("[MemoryCapsule] Milestones listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
-    return unsub;
-  }, [userProfile?.groupId]);
+    return () => {
+      isCleanedUp = true;
+      unsub();
+    };
+  }, [userProfile?.groupId, retryTrigger]);
 
   // Load memories for active milestone
   useEffect(() => {
     if (!activeMilestoneId || !userProfile?.groupId) return;
+
+    let isCleanedUp = false;
 
     const q = query(
       collection(db, "memories"),
@@ -126,6 +150,7 @@ export default function MemoryCapsuleScreen() {
     const unsub = onSnapshot(
       q,
       (snap) => {
+        if (isCleanedUp) return;
         const loaded: Memory[] = snap.docs
           .map((d) => ({ id: d.id, ...d.data() } as Memory))
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -133,11 +158,19 @@ export default function MemoryCapsuleScreen() {
       },
       (err) => {
         console.error("[MemoryCapsule] Load memories error:", err);
+        if (!isCleanedUp) {
+          setTimeout(() => {
+            setRetryTrigger(prev => prev + 1);
+          }, 1500);
+        }
       }
     );
 
-    return unsub;
-  }, [activeMilestoneId, userProfile?.groupId]);
+    return () => {
+      isCleanedUp = true;
+      unsub();
+    };
+  }, [activeMilestoneId, userProfile?.groupId, retryTrigger]);
 
   // Calculate days between a date string and today
   const calculateDays = (dateStr: string): number => {

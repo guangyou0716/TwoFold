@@ -58,6 +58,8 @@ A premium, real-time couple companion app built with React Native (Expo) and Fir
 - Reminder timezone configuration
 - **🌐 Language selector** — full English & Chinese (中文) support across the entire app
 - Partner link/unlink management
+- **📥 GDPR Data Portability (Data Export)** — package and export all of your profile parameters and financial/milestone logs in JSON format using a native share sheet
+- **⚠️ Thorough Account Deletion (Right to Erasure)** — deleting a solo account thoroughly erases your group, budget logs, reminders, timeline notes, and savings goals from our cloud servers to prevent orphaned records
 
 ---
 
@@ -89,6 +91,7 @@ twofold/
 ├── firebaseConfig.ts              # Firebase initialization (reads from .env.local)
 ├── firestore.rules                # Production Firestore security rules
 ├── app.json                       # Expo config (bundle ID, permissions, plugins)
+├── eas.json                       # EAS Build & Submit configurations (development, preview, production)
 ├── package.json
 ├── tsconfig.json
 ├── .env.local                     # ⚠️ Secret — gitignored, never commit this
@@ -189,6 +192,9 @@ TwoFold is designed with security as a first-class concern.
 ### Firestore Security Rules
 All database access is protected by strict production-grade Firestore security rules (`firestore.rules`):
 
+- **🛡️ Group Spoofing Prevention:** The rules enforce structured patterns for user profile transitions. An owner is prohibited from changing their own profile `groupId` or `partnerId` to spoof membership in other groups. Solo users are restricted to `solo_${uid}` and couples to `group_${uid}_${partnerId}`.
+- **🔗 Transactional Pairing Guard:** Users are allowed to update a target partner's document *only* to link with themselves, and *only* if the target partner is completely unpaired, preventing BOLA and concurrent linking hijacking.
+
 | Collection | Access Control |
 |------------|---------------|
 | `/users/{uid}` | Owner only; partner can read their partner's profile via stored `partnerId` |
@@ -243,6 +249,8 @@ npm run android    # Open on Android emulator / device
 npm run ios        # Open on iOS simulator / device
 npm run web        # Open in web browser
 npx tsc --noEmit   # Type-check without building
+eas build --profile production # Build a production release binary via EAS
+eas submit -p all  # Submit builds directly to Play Store / App Store
 ```
 
 ---

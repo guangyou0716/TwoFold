@@ -38,6 +38,8 @@ function HomeTabNavigator() {
       if (data?.languagePreference) {
         setLanguagePreference(data.languagePreference);
       }
+    }, (error) => {
+      console.log("[RootNavigator] HomeTabNavigator profile deleted or unauthorized:", error.message);
     });
     return unsub;
   }, [currentUser]);
