@@ -150,6 +150,10 @@ export default function DashboardScreen() {
   // Session guard: ensures the new-user setup prompt only fires once per app session
   const setupPromptShown = useRef(false);
 
+  // Self-healing listener retry trigger for permission-denied race conditions
+  const [retryTrigger, setRetryTrigger] = useState(0);
+
+
   // Refs
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -165,10 +169,10 @@ export default function DashboardScreen() {
   // Request local notification permissions on mount
   useEffect(() => {
     (async () => {
-      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      const { status: existingStatus } = await Notifications.getPermissionsAsync() as any;
       let finalStatus = existingStatus;
       if (existingStatus !== "granted") {
-        const { status } = await Notifications.requestPermissionsAsync();
+        const { status } = await Notifications.requestPermissionsAsync() as any;
         finalStatus = status;
       }
     })();
@@ -183,6 +187,8 @@ export default function DashboardScreen() {
       if (data) {
         setUserProfile(data);
       }
+    }, (error) => {
+      console.log("[Dashboard] User profile deleted or unauthorized:", error.message);
     });
 
     return unsubUser;
@@ -237,6 +243,8 @@ export default function DashboardScreen() {
 
     const unsubPartner = onSnapshot(doc(db, "users", userProfile.partnerId), (snap) => {
       setPartnerProfile(snap.data() as UserProfile ?? null);
+    }, (error) => {
+      console.log("[Dashboard] Partner profile deleted or unauthorized:", error.message);
     });
 
     return unsubPartner;
@@ -247,8 +255,18 @@ export default function DashboardScreen() {
     if (!userProfile?.groupId) return;
 
     setLoading(true);
+    let isCleanedUp = false;
+
     const unsubGroup = onSnapshot(doc(db, "groups", userProfile.groupId), (snap) => {
+      if (isCleanedUp) return;
       setGroup(snap.data() as GroupProfile ?? null);
+    }, (error) => {
+      console.log("[Dashboard] Group listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     // Listen to ALL reminders/tasks
@@ -257,11 +275,19 @@ export default function DashboardScreen() {
       where("groupId", "==", userProfile.groupId)
     );
     const unsubTasks = onSnapshot(qTasks, (snap) => {
+      if (isCleanedUp) return;
       const loaded: Task[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as Task)
       );
       loaded.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       setTasks(loaded);
+    }, (error) => {
+      console.log("[Dashboard] Tasks listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     // Listen to milestones for summary widget
@@ -270,14 +296,21 @@ export default function DashboardScreen() {
       where("groupId", "==", userProfile.groupId)
     );
     const unsubMilestones = onSnapshot(qMilestones, (snap) => {
+      if (isCleanedUp) return;
       const loaded: Milestone[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as Milestone)
       );
       loaded.sort((a, b) => a.date.localeCompare(b.date));
       setMilestones(loaded);
       setLoading(false);
-    }, () => {
+    }, (error) => {
+      console.log("[Dashboard] Milestones listener error:", error.message);
       setLoading(false);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
 
     // Listen to savings goals for home dashboard widget
@@ -286,36 +319,57 @@ export default function DashboardScreen() {
       where("groupId", "==", userProfile.groupId)
     );
     const unsubSavings = onSnapshot(qSavings, (snap) => {
+      if (isCleanedUp) return;
       const loaded: SavingsGoal[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as SavingsGoal)
       );
       loaded.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       setSavingsGoals(loaded);
-    }, () => {});
+    }, (error) => {
+      console.log("[Dashboard] Savings listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
+    });
 
     return () => {
+      isCleanedUp = true;
       unsubGroup();
       unsubTasks();
       unsubMilestones();
       unsubSavings();
     };
-  }, [userProfile?.groupId]);
+  }, [userProfile?.groupId, retryTrigger]);
 
   // 4. Listen to transactions to calculate remaining pool balance dynamically on Home
   useEffect(() => {
     if (!userProfile?.groupId) return;
+    let isCleanedUp = false;
     const qTransactions = query(
       collection(db, "transactions"),
       where("groupId", "==", userProfile.groupId)
     );
     const unsubTransactions = onSnapshot(qTransactions, (snap) => {
+      if (isCleanedUp) return;
       const loaded: Transaction[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as Transaction)
       );
       setTransactions(loaded);
+    }, (error) => {
+      console.log("[Dashboard] Transactions listener error:", error.message);
+      if (!isCleanedUp) {
+        setTimeout(() => {
+          setRetryTrigger(prev => prev + 1);
+        }, 1500);
+      }
     });
-    return unsubTransactions;
-  }, [userProfile?.groupId]);
+    return () => {
+      isCleanedUp = true;
+      unsubTransactions();
+    };
+  }, [userProfile?.groupId, retryTrigger]);
 
   // Note: Memory data is managed in MemoryCapsuleScreen. The dashboard only
   // shows the featured milestone widget and budget summary.
@@ -355,6 +409,8 @@ export default function DashboardScreen() {
           }
         }
       }
+    }, (error) => {
+      console.log("[Dashboard] Nudges listener error:", error.message);
     });
 
     return unsubNudges;

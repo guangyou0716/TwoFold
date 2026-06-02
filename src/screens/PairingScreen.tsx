@@ -42,6 +42,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
       if (data?.languagePreference) {
         setLanguagePreference(data.languagePreference as "en" | "zh");
       }
+    }, (error) => {
+      console.log("[Pairing] User profile listener error:", error.message);
     });
     return unsub;
   }, [currentUser]);

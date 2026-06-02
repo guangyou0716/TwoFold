@@ -36,8 +36,47 @@ service cloud.firestore {
         myProfile().partnerId == uid
       );
       allow create: if isSignedIn() && isOwner(uid);
-      allow update: if isSignedIn() && isOwner(uid);
-      allow delete: if false; // Users cannot delete their own profile
+      allow update: if isSignedIn() && (
+        // 1. Owner updates their own profile
+        (
+          isOwner(uid) && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['groupId', 'partnerId', 'isSolo']) || (
+              // Case A: Going Solo
+              request.resource.data.groupId == "solo_" + uid &&
+              request.resource.data.partnerId == "" &&
+              request.resource.data.isSolo == true
+            ) || (
+              // Case B: Resetting / Unlinking
+              request.resource.data.groupId == "" &&
+              request.resource.data.partnerId == "" &&
+              request.resource.data.isSolo == true
+            ) || (
+              // Case C: Connecting with partner
+              (request.resource.data.groupId == "group_" + uid + "_" + request.resource.data.partnerId ||
+               request.resource.data.groupId == "group_" + request.resource.data.partnerId + "_" + uid) &&
+              (request.resource.data.isSolo == false || !('isSolo' in request.resource.data))
+            )
+          )
+        ) ||
+        // 2. Partner unlinks this user (from Settings Screen unlinking batch)
+        (
+          myProfile().partnerId == uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerId', 'groupId', 'isSolo']) &&
+          request.resource.data.partnerId == "" &&
+          request.resource.data.groupId == "" &&
+          request.resource.data.isSolo == true
+        ) ||
+        // 3. Partner initiates pairing with this user (when this user is unpaired)
+        (
+          ( !('partnerId' in resource.data) || resource.data.partnerId == "" || !('partnerId' in resource.data) ) &&
+          ( !('groupId' in resource.data) || resource.data.groupId == "" || !('groupId' in resource.data) ) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerId', 'groupId', 'isSolo']) &&
+          request.resource.data.partnerId == request.auth.uid &&
+          (request.resource.data.groupId == "group_" + request.auth.uid + "_" + uid ||
+           request.resource.data.groupId == "group_" + uid + "_" + request.auth.uid)
+        )
+      );
+      allow delete: if isSignedIn() && isOwner(uid);
     }
 
     // -------------------------------------------------------------------------
@@ -45,7 +84,13 @@ service cloud.firestore {
     // - Only members of the group (partnerAId or partnerBId) can read/write.
     // -------------------------------------------------------------------------
     match /groups/{groupId} {
-      allow read, write: if isSignedIn() && isMemberOfGroup(groupId);
+      allow read, write: if isSignedIn() && (
+        isMemberOfGroup(groupId) ||
+        resource.data.partnerAId == request.auth.uid ||
+        resource.data.partnerBId == request.auth.uid ||
+        request.resource.data.partnerAId == request.auth.uid ||
+        request.resource.data.partnerBId == request.auth.uid
+      );
     }
 
     // -------------------------------------------------------------------------
