@@ -13,6 +13,8 @@ A premium, real-time couple companion app built with React Native (Expo) and Fir
 
 </div>
 
+<img width="941" height="1672" alt="image" src="https://github.com/user-attachments/assets/046ba70d-6c8c-4798-9687-e3a0a824d6ae" />
+
 ---
 
 ## ✨ Features
