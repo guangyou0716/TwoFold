@@ -1,0 +1,24 @@
+{
+  "name": "twofold-functions",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Trusted backend for TwoFold: receipt OCR, recurring transactions, invite codes, export/delete jobs.",
+  "main": "lib/index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit",
+    "test": "tsc && node --test tests/*.test.js",
+    "serve": "firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

@@ -15,8 +15,18 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as Clipboard from "expo-clipboard";
-import { UserProfile, GroupProfile, Task, Milestone, Transaction, SavingsGoal, HomeTabParamList } from "../types";
+import { Task, Milestone, HomeTabParamList } from "../types";
+import {
+  DashboardSkeleton,
+  ExecutiveHeader,
+  BudgetSummary,
+  MilestoneHero,
+  SavingsGoalsPreview,
+  NudgeBar,
+  ReminderList,
+} from "../features/dashboard/components";
 import { translations } from "../utils/translations";
+import { ErrorState } from "../components/primitives/ErrorState";
 import { useNavigation } from "@react-navigation/native";
 import { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
 import DateTimePicker from "@react-native-community/datetimepicker";
@@ -29,14 +39,23 @@ import {
   addDoc,
   query,
   where,
-  writeBatch,
-  getDoc,
   deleteDoc
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
-import { auth, db } from "../../firebaseConfig";
+import { httpsCallable } from "firebase/functions";
+import { auth, db, functions } from "../../firebaseConfig";
+import { useUserProfile } from "../hooks/useUserProfile";
+import { useUserProfileById } from "../hooks/useUserProfileById";
+import { useGroup } from "../hooks/useGroup";
+import { useTasks } from "../hooks/useTasks";
+import { useMilestones } from "../hooks/useMilestones";
+import { useSavingsGoals } from "../hooks/useSavingsGoals";
+import { useTransactions } from "../hooks/useTransactions";
+import { useNotificationPermissions } from "../hooks/useNotificationPermissions";
 
 // Configure notification alerts when app is in foreground
+let lastOpenedNotificationId: string | null = null;
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
@@ -67,14 +86,33 @@ export default function DashboardScreen() {
   const currentUser = auth.currentUser;
   const navigation = useNavigation<BottomTabNavigationProp<HomeTabParamList>>();
 
-  // State declarations first
-  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [partnerProfile, setPartnerProfile] = useState<UserProfile | null>(null);
-  const [group, setGroup] = useState<GroupProfile | null>(null);
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [milestones, setMilestones] = useState<Milestone[]>([]);
-  const [savingsGoals, setSavingsGoals] = useState<SavingsGoal[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Shared per-domain subscriptions. Each hook owns its listener (with
+  // loading/error/retry) so the screen no longer manages raw onSnapshot effects.
+  const { profile: userProfile } = useUserProfile(currentUser);
+  const { profile: partnerProfile } = useUserProfileById(userProfile?.partnerId);
+  const { group, error: groupError, retry: retryGroup } = useGroup(userProfile?.groupId);
+  const { tasks, error: tasksError, retry: retryTasks } = useTasks(userProfile?.groupId);
+  const {
+    milestones,
+    loading: milestonesLoading,
+    error: milestonesError,
+    retry: retryMilestones,
+  } = useMilestones(userProfile?.groupId);
+  const { goals: savingsGoals, error: savingsError, retry: retrySavings } =
+    useSavingsGoals(userProfile?.groupId);
+  const { transactions, error: txError, retry: retryTx } =
+    useTransactions(userProfile?.groupId);
+  const { ensurePermission: ensureNotificationPermission } = useNotificationPermissions();
+
+  const loading = milestonesLoading;
+  const collectionError = milestonesError ?? tasksError ?? savingsError ?? txError ?? groupError;
+  const retryAll = useCallback(() => {
+    retryGroup();
+    retryTasks();
+    retryMilestones();
+    retrySavings();
+    retryTx();
+  }, [retryGroup, retryTasks, retryMilestones, retrySavings, retryTx]);
 
   const lang = userProfile?.languagePreference ?? "en";
   const t = useCallback(
@@ -139,20 +177,68 @@ export default function DashboardScreen() {
   // Pairing Modal state
   const [pairModalVisible, setPairModalVisible] = useState(false);
   const [partnerCode, setPartnerCode] = useState("");
+  const [inviteCode, setInviteCode] = useState<string | null>(null);
+  const [inviteLoading, setInviteLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [pairingLoading, setPairingLoading] = useState(false);
 
   // Reminders Status Toggle & Highlight counters
   const [editTaskStatus, setEditTaskStatus] = useState<"pending" | "completed">("pending");
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const pendingNotificationTask = useRef<string | null>(null);
+
+  const openTask = useCallback((item: Task) => {
+    setSelectedTask(item);
+    setEditTaskTitle(item.title);
+    setEditTaskDate(item.dueDate ? new Date(item.dueDate) : new Date());
+    setEditTaskAllDay(item.isAllDay ?? true);
+    setEditTaskRemind(item.remindTiming ?? "at_time");
+    setEditTaskRecurrence(item.recurrence ?? "none");
+    setEditTaskStatus(item.status);
+    if (item.dueTime) {
+      const [h, m] = item.dueTime.split(":").map(Number);
+      const d = new Date();
+      d.setHours(h, m, 0, 0);
+      setEditTaskTime(d);
+    } else {
+      setEditTaskTime(new Date());
+    }
+    setEditModalVisible(true);
+  }, []);
+
+  const tryOpenNotificationTask = useCallback((taskId: string) => {
+    const item = tasks.find((task) => task.id === taskId);
+    if (!item) {
+      pendingNotificationTask.current = taskId;
+      return;
+    }
+    pendingNotificationTask.current = null;
+    navigation.navigate("Dashboard");
+    openTask(item);
+  }, [tasks, navigation, openTask]);
+
+  useEffect(() => {
+    if (pendingNotificationTask.current) {
+      tryOpenNotificationTask(pendingNotificationTask.current);
+    }
+  }, [tasks, tryOpenNotificationTask]);
+
+  useEffect(() => {
+    const handle = (response: Notifications.NotificationResponse | null | undefined) => {
+      if (!response) return;
+      const identifier = response.notification.request.identifier;
+      const taskId = response.notification.request.content.data?.taskId;
+      if (!identifier || typeof taskId !== "string" || lastOpenedNotificationId === identifier) return;
+      lastOpenedNotificationId = identifier;
+      tryOpenNotificationTask(taskId);
+    };
+    const subscription = Notifications.addNotificationResponseReceivedListener(handle);
+    void Notifications.getLastNotificationResponseAsync().then(handle).catch(() => {});
+    return () => subscription.remove();
+  }, [tryOpenNotificationTask]);
   const [featuredModalVisible, setFeaturedModalVisible] = useState(false);
 
   // Session guard: ensures the new-user setup prompt only fires once per app session
   const setupPromptShown = useRef(false);
-
-  // Self-healing listener retry trigger for permission-denied race conditions
-  const [retryTrigger, setRetryTrigger] = useState(0);
-
 
   // Refs
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -166,33 +252,10 @@ export default function DashboardScreen() {
     };
   }, []);
 
-  // Request local notification permissions on mount
-  useEffect(() => {
-    (async () => {
-      const { status: existingStatus } = await Notifications.getPermissionsAsync() as any;
-      let finalStatus = existingStatus;
-      if (existingStatus !== "granted") {
-        const { status } = await Notifications.requestPermissionsAsync() as any;
-        finalStatus = status;
-      }
-    })();
-  }, []);
+  // Notification permission is requested on first need (when a reminder is
+  // actually scheduled), with an explanation — see useNotificationPermissions.
 
-  // 1. Subscribe to current user's profile
-  useEffect(() => {
-    if (!currentUser) return;
 
-    const unsubUser = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
-      const data = snap.data() as UserProfile | undefined;
-      if (data) {
-        setUserProfile(data);
-      }
-    }, (error) => {
-      console.log("[Dashboard] User profile deleted or unauthorized:", error.message);
-    });
-
-    return unsubUser;
-  }, [currentUser]);
 
   // Setup prompt for newly registered users — only shown once per app session
   useEffect(() => {
@@ -232,144 +295,14 @@ export default function DashboardScreen() {
         { cancelable: false }
       );
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot guarded by setupPromptShown ref; alert must only ever appear once per session.
   }, [userProfile?.isNewUser, lang]);
 
-  // 2. Subscribe to partner profile
-  useEffect(() => {
-    if (!userProfile?.partnerId) {
-      setPartnerProfile(null);
-      return;
-    }
 
-    const unsubPartner = onSnapshot(doc(db, "users", userProfile.partnerId), (snap) => {
-      setPartnerProfile(snap.data() as UserProfile ?? null);
-    }, (error) => {
-      console.log("[Dashboard] Partner profile deleted or unauthorized:", error.message);
-    });
 
-    return unsubPartner;
-  }, [userProfile?.partnerId]);
 
-  // 3. Subscribe to group, tasks, and milestones
-  useEffect(() => {
-    if (!userProfile?.groupId) return;
 
-    setLoading(true);
-    let isCleanedUp = false;
 
-    const unsubGroup = onSnapshot(doc(db, "groups", userProfile.groupId), (snap) => {
-      if (isCleanedUp) return;
-      setGroup(snap.data() as GroupProfile ?? null);
-    }, (error) => {
-      console.log("[Dashboard] Group listener error:", error.message);
-      if (!isCleanedUp) {
-        setTimeout(() => {
-          setRetryTrigger(prev => prev + 1);
-        }, 1500);
-      }
-    });
-
-    // Listen to ALL reminders/tasks
-    const qTasks = query(
-      collection(db, "tasks"),
-      where("groupId", "==", userProfile.groupId)
-    );
-    const unsubTasks = onSnapshot(qTasks, (snap) => {
-      if (isCleanedUp) return;
-      const loaded: Task[] = snap.docs.map(
-        (d) => ({ id: d.id, ...d.data() } as Task)
-      );
-      loaded.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      setTasks(loaded);
-    }, (error) => {
-      console.log("[Dashboard] Tasks listener error:", error.message);
-      if (!isCleanedUp) {
-        setTimeout(() => {
-          setRetryTrigger(prev => prev + 1);
-        }, 1500);
-      }
-    });
-
-    // Listen to milestones for summary widget
-    const qMilestones = query(
-      collection(db, "milestones"),
-      where("groupId", "==", userProfile.groupId)
-    );
-    const unsubMilestones = onSnapshot(qMilestones, (snap) => {
-      if (isCleanedUp) return;
-      const loaded: Milestone[] = snap.docs.map(
-        (d) => ({ id: d.id, ...d.data() } as Milestone)
-      );
-      loaded.sort((a, b) => a.date.localeCompare(b.date));
-      setMilestones(loaded);
-      setLoading(false);
-    }, (error) => {
-      console.log("[Dashboard] Milestones listener error:", error.message);
-      setLoading(false);
-      if (!isCleanedUp) {
-        setTimeout(() => {
-          setRetryTrigger(prev => prev + 1);
-        }, 1500);
-      }
-    });
-
-    // Listen to savings goals for home dashboard widget
-    const qSavings = query(
-      collection(db, "savings_goals"),
-      where("groupId", "==", userProfile.groupId)
-    );
-    const unsubSavings = onSnapshot(qSavings, (snap) => {
-      if (isCleanedUp) return;
-      const loaded: SavingsGoal[] = snap.docs.map(
-        (d) => ({ id: d.id, ...d.data() } as SavingsGoal)
-      );
-      loaded.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      setSavingsGoals(loaded);
-    }, (error) => {
-      console.log("[Dashboard] Savings listener error:", error.message);
-      if (!isCleanedUp) {
-        setTimeout(() => {
-          setRetryTrigger(prev => prev + 1);
-        }, 1500);
-      }
-    });
-
-    return () => {
-      isCleanedUp = true;
-      unsubGroup();
-      unsubTasks();
-      unsubMilestones();
-      unsubSavings();
-    };
-  }, [userProfile?.groupId, retryTrigger]);
-
-  // 4. Listen to transactions to calculate remaining pool balance dynamically on Home
-  useEffect(() => {
-    if (!userProfile?.groupId) return;
-    let isCleanedUp = false;
-    const qTransactions = query(
-      collection(db, "transactions"),
-      where("groupId", "==", userProfile.groupId)
-    );
-    const unsubTransactions = onSnapshot(qTransactions, (snap) => {
-      if (isCleanedUp) return;
-      const loaded: Transaction[] = snap.docs.map(
-        (d) => ({ id: d.id, ...d.data() } as Transaction)
-      );
-      setTransactions(loaded);
-    }, (error) => {
-      console.log("[Dashboard] Transactions listener error:", error.message);
-      if (!isCleanedUp) {
-        setTimeout(() => {
-          setRetryTrigger(prev => prev + 1);
-        }, 1500);
-      }
-    });
-    return () => {
-      isCleanedUp = true;
-      unsubTransactions();
-    };
-  }, [userProfile?.groupId, retryTrigger]);
 
   // Note: Memory data is managed in MemoryCapsuleScreen. The dashboard only
   // shows the featured milestone widget and budget summary.
@@ -416,10 +349,25 @@ export default function DashboardScreen() {
     return unsubNudges;
   }, [currentUser, userProfile?.partnerId, partnerProfile?.displayName]);
 
+  const createInviteCode = async () => {
+    if (!currentUser) return;
+    setInviteLoading(true);
+    try {
+      const createInvite = httpsCallable<undefined, { code: string }>(functions, "createInvite");
+      const result = await createInvite();
+      setInviteCode(result.data.code);
+    } catch (error) {
+      console.error("[Dashboard] Invite creation failed:", error);
+      Alert.alert(t("pairFailedTitle"), t("pairPleaseCode"));
+    } finally {
+      setInviteLoading(false);
+    }
+  };
+
   // Copy own invite code
   const copyToClipboard = async () => {
-    if (!currentUser) return;
-    await Clipboard.setStringAsync(currentUser.uid);
+    if (!inviteCode) return;
+    await Clipboard.setStringAsync(inviteCode);
     setCopied(true);
     if (copyTimeoutRef.current) {
       clearTimeout(copyTimeoutRef.current);
@@ -431,10 +379,10 @@ export default function DashboardScreen() {
 
   // Share own invite code
   const shareCode = async () => {
-    if (!currentUser) return;
+    if (!inviteCode) return;
     try {
       await Share.share({
-        message: t("pairShareMsg").replace("{code}", currentUser.uid),
+        message: t("pairShareMsg").replace("{code}", inviteCode),
         title: t("pairShareTitle"),
       });
     } catch {
@@ -452,65 +400,23 @@ export default function DashboardScreen() {
       return;
     }
 
-    if (cleanedCode === currentUser.uid) {
-      Alert.alert(t("pairSelfLinking"), t("pairSelfLinkingMsg"));
-      return;
-    }
-
     setPairingLoading(true);
     try {
-      const partnerDocRef = doc(db, "users", cleanedCode);
-      const partnerSnap = await getDoc(partnerDocRef);
-
-      if (!partnerSnap.exists()) {
-        Alert.alert(t("pairInvalidCode"), t("pairPleaseCode"));
-        setPairingLoading(false);
-        return;
-      }
-
-      const partnerData = partnerSnap.data();
-
-      if (partnerData.partnerId) {
-        Alert.alert(t("pairPartnerAlreadyPairedTitle"), t("pairPartnerAlreadyPairedMsg"));
-        setPairingLoading(false);
-        return;
-      }
-
-      const sharedGroupId = `group_${currentUser.uid}_${cleanedCode}`;
-      const batch = writeBatch(db);
-
-      batch.set(doc(db, "groups", sharedGroupId), {
-        groupId: sharedGroupId,
-        partnerAId: currentUser.uid,
-        partnerBId: cleanedCode,
-        balances: {},
-        budgetBalance: 1000, // starting budget allowance
-        streaks: {
-          choreStreak: 0,
-          lastChoreDate: null,
-        },
-        createdAt: new Date().toISOString(),
-      });
-
-      batch.update(doc(db, "users", currentUser.uid), {
-        partnerId: cleanedCode,
-        groupId: sharedGroupId,
-        isSolo: false,
-      });
-
-      batch.update(doc(db, "users", cleanedCode), {
-        partnerId: currentUser.uid,
-        groupId: sharedGroupId,
-        isSolo: false,
-      });
-
-      await batch.commit();
+      const claimInvite = httpsCallable<{ code: string }, unknown>(functions, "claimInvite");
+      await claimInvite({ code: cleanedCode });
       setPairModalVisible(false);
       setPartnerCode("");
-      Alert.alert(t("pairConnectedTitle"), t("pairConnectedMsg"));
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "An unexpected error occurred.";
-      Alert.alert(t("pairFailedTitle"), message);
+      if (message.includes("INVALID_INVITE")) {
+        Alert.alert(t("pairInvalidCode"), t("pairPleaseCode"));
+      } else if (message.includes("INVITE_USED") || message.includes("INVITE_EXPIRED")) {
+        Alert.alert(t("pairInvalidCode"), message.includes("INVITE_USED") ? "This invite has already been used." : "This invite has expired.");
+      } else if (message.includes("CREATOR_ALREADY_PAIRED")) {
+        Alert.alert(t("pairPartnerAlreadyPairedTitle"), t("pairPartnerAlreadyPairedMsg"));
+      } else {
+        Alert.alert(t("pairFailedTitle"), message);
+      }
     } finally {
       setPairingLoading(false);
     }
@@ -526,6 +432,10 @@ export default function DashboardScreen() {
     recurrence?: Task["recurrence"]
   ) => {
     if (!remindTiming || remindTiming === "none") return null;
+
+    // Ask for notification permission only when a reminder first needs it.
+    const granted = await ensureNotificationPermission();
+    if (!granted) return null;
 
     try {
       // 1. Calculate notification trigger time
@@ -989,9 +899,18 @@ export default function DashboardScreen() {
   const remainingBalance = startingAllowance - totalExpenses + totalIncomes;
 
   if (loading) {
+    return <DashboardSkeleton colors={colors} />;
+  }
+
+  if (collectionError) {
     return (
-      <SafeAreaView style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
-        <ActivityIndicator size="large" color="#FF5E7E" />
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+        <ErrorState
+          title="Couldn't load your dashboard"
+          message={collectionError}
+          retryLabel="Retry"
+          onRetry={retryAll}
+        />
       </SafeAreaView>
     );
   }
@@ -1001,307 +920,64 @@ export default function DashboardScreen() {
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
 
         {/* Executive Header */}
-        <View style={styles.header}>
-          <View>
-            <Text style={[styles.greeting, { color: colors.text }]}>{t("dashGreeting")}{userProfile?.displayName ?? "…"} 👋</Text>
-            {userProfile?.isSolo ? (
-              <TouchableOpacity
-                style={styles.linkPartnerHeaderBtn}
-                onPress={() => setPairModalVisible(true)}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.linkPartnerHeaderText}>{t("dashSoloMode")}</Text>
-              </TouchableOpacity>
-            ) : (
-              <Text style={[styles.coupleLabel, { color: colors.subtitle }]}>
-                {t("dashConnectedWith")}<Text style={styles.partnerName}>{partnerProfile?.displayName ?? "…"}</Text>
-              </Text>
-            )}
-          </View>
-          <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
-            <Text style={styles.logoutBtnText}>{lang === "zh" ? "退出" : "Logout"}</Text>
-          </TouchableOpacity>
-        </View>
-
+        <ExecutiveHeader
+          colors={colors}
+          t={t}
+          lang={lang}
+          displayName={userProfile?.displayName ?? null}
+          partnerName={partnerProfile?.displayName ?? null}
+          isSolo={!!userProfile?.isSolo}
+          onLogout={handleLogout}
+          onLinkPartner={() => {
+            setPairModalVisible(true);
+            if (!inviteCode) void createInviteCode();
+          }}
+        />
         {/* Executive Summary Stats Grid */}
-        <View style={styles.summaryGrid}>
-          <View style={[styles.summaryCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={[styles.summaryLabel, { color: colors.subtitle }]}>{t("dashRemainingBalance")}</Text>
-            <Text 
-              numberOfLines={1} 
-              adjustsFontSizeToFit 
-              minimumFontScale={0.5} 
-              style={[styles.summaryValue, remainingBalance < 0 && { color: "#FF3B30" }, { color: remainingBalance >= 0 ? "#34C759" : "#FF3B30" }]}
-            >
-              {activeCurrency}{remainingBalance.toFixed(2)}
-            </Text>
-            <Text style={[styles.summarySub, { color: colors.inactiveText }]}>{t("dashSharedPoolSub")}</Text>
-          </View>
-          <View style={[styles.summaryCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={[styles.summaryLabel, { color: colors.subtitle }]}>{t("dashRemindersCount")}</Text>
-            <Text style={[styles.summaryValue, { color: "#FF5E7E" }]}>
-              {activeRemindersCount}
-            </Text>
-            <Text style={[styles.summarySub, { color: colors.inactiveText }]}>{t("dashActiveChecklistsSub")}</Text>
-          </View>
-        </View>
-
+        <BudgetSummary
+          colors={colors}
+          t={t}
+          remainingBalance={remainingBalance}
+          activeCurrency={activeCurrency}
+          activeRemindersCount={activeRemindersCount}
+        />
         {/* Custom Pinned Milestone Highlight Widget */}
-        {featuredMilestone ? (
-          <TouchableOpacity
-            style={[styles.milestoneCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-            onPress={() => setFeaturedModalVisible(true)}
-            activeOpacity={0.7}
-          >
-            <View style={styles.milestoneIconRow}>
-              <Text style={styles.milestoneEmoji}>💖</Text>
-              <View style={{ flex: 1 }}>
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                  <Text style={[styles.milestoneTitle, { color: colors.text }]}>{featuredMilestone.title}</Text>
-                  <Text style={{ fontSize: 12 }}>✏️</Text>
-                </View>
-                <Text style={[styles.milestoneMeta, { color: colors.subtitle }]}>
-                  {new Date(featuredMilestone.date).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US", { year: 'numeric', month: 'long', day: 'numeric' })}
-                </Text>
-              </View>
-              <View style={styles.milestoneBadge}>
-                <Text style={styles.milestoneBadgeText}>
-                  {getMilestoneLabel(featuredMilestone)}
-                </Text>
-              </View>
-            </View>
-          </TouchableOpacity>
-        ) : (
-          <TouchableOpacity
-            style={[styles.milestoneCard, { backgroundColor: colors.card, borderColor: colors.border, borderStyle: "dashed", alignItems: "center", justifyContent: "center", paddingVertical: 20 }]}
-            onPress={() => setFeaturedModalVisible(true)}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.milestoneTitle, { color: colors.subtitle, textAlign: "center" }]}>
-              {lang === "zh" ? "💖 点击选择纪念日 / 里程碑倒计时" : "💖 Tap to Select Anniversary / Milestone Countdown"}
-            </Text>
-          </TouchableOpacity>
-        )}
-
+        <MilestoneHero
+          colors={colors}
+          lang={lang}
+          milestone={featuredMilestone ?? null}
+          label={featuredMilestone ? getMilestoneLabel(featuredMilestone) : null}
+          onPress={() => setFeaturedModalVisible(true)}
+        />
         {/* Savings Goals Home Progress Widget */}
-        {savingsGoals.length > 0 && (
-          <View style={styles.savingsHomeWidget}>
-            <Text style={[styles.sectionTitle, { color: colors.text, marginTop: 12, marginBottom: 12 }]}>
-              {lang === "zh" ? "🐷 储蓄目标进度" : "🐷 Savings Goals Progress"}
-            </Text>
-            {savingsGoals.map((goal) => {
-              const progressPercent = Math.min(100, Math.round((goal.currentAmount / goal.targetAmount) * 100));
-              const daysLeft = goal.targetDate ? Math.max(0, Math.ceil((new Date(goal.targetDate).getTime() - new Date().setHours(0,0,0,0)) / (1000 * 60 * 60 * 24))) : null;
-
-              return (
-                <View key={goal.id} style={[styles.savingsHomeCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                    <Text style={[styles.savingsHomeTitle, { color: colors.text }]}>🐷 {goal.title}</Text>
-                    <Text style={[styles.savingsHomeProgressText, { color: progressPercent >= 100 ? "#34C759" : "#FF5E7E" }]}>
-                      {activeCurrency}{goal.currentAmount.toFixed(0)} / {activeCurrency}{goal.targetAmount.toFixed(0)} ({progressPercent}%)
-                    </Text>
-                  </View>
-                  
-                  {/* Progress Bar */}
-                  <View style={styles.savingsHomeProgressBarBg}>
-                    <View style={[styles.savingsHomeProgressBarFill, { width: `${progressPercent}%`, backgroundColor: progressPercent >= 100 ? "#34C759" : "#FF5E7E" }]} />
-                  </View>
-
-                  <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                    {goal.targetDate ? (
-                      <Text style={styles.savingsHomeDateText}>
-                        📅 {new Date(goal.targetDate).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US")} ({daysLeft !== null && daysLeft > 0 ? (lang === "zh" ? `还剩 ${daysLeft} 天` : `${daysLeft} days left`) : (lang === "zh" ? "已到期" : "Due")})
-                      </Text>
-                    ) : (
-                      <Text style={styles.savingsHomeDateText}>📅 {lang === "zh" ? "无截止日期" : "No deadline"}</Text>
-                    )}
-                    {progressPercent >= 100 && (
-                      <Text style={{ fontSize: 11, fontWeight: "700", color: "#34C759" }}>
-                        🎉 {lang === "zh" ? "已达成！" : "Completed!"}
-                      </Text>
-                    )}
-                  </View>
-                </View>
-              );
-            })}
-          </View>
-        )}
-
+        <SavingsGoalsPreview
+          colors={colors}
+          lang={lang}
+          activeCurrency={activeCurrency}
+          goals={savingsGoals}
+        />
         {/* Playful Nudges Grid */}
-        <Text style={[styles.sectionTitle, { color: colors.text }]}>{t("dashSendNudge")}</Text>
-        <View style={styles.nudgesRow}>
-          <TouchableOpacity style={[styles.nudgeBtn, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => handleSendNudge("❤️ Hug")}>
-            <Text style={styles.nudgeBtnEmoji}>❤️</Text>
-            <Text style={[styles.nudgeBtnText, { color: colors.subtitle }]}>{lang === "zh" ? "拥抱" : "Hug"}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.nudgeBtn, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => handleSendNudge("🔔 Poke")}>
-            <Text style={styles.nudgeBtnEmoji}>🔔</Text>
-            <Text style={[styles.nudgeBtnText, { color: colors.subtitle }]}>{lang === "zh" ? "戳一戳" : "Poke"}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.nudgeBtn, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => handleSendNudge("☕ Coffee")}>
-            <Text style={styles.nudgeBtnEmoji}>☕</Text>
-            <Text style={[styles.nudgeBtnText, { color: colors.subtitle }]}>{lang === "zh" ? "喝咖啡？" : "Coffee?"}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.nudgeBtn, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => handleSendNudge("🌙 Miss you")}>
-            <Text style={styles.nudgeBtnEmoji}>🌙</Text>
-            <Text style={[styles.nudgeBtnText, { color: colors.subtitle }]}>{lang === "zh" ? "想你啦" : "Miss You"}</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Reminders / Chores Section Headers */}
-        <View style={styles.choresHeaderRow}>
-          <Text style={[styles.sectionTitle, { color: colors.text }]}>{t("dashRemindersChores")}</Text>
-          <TouchableOpacity style={styles.addTaskBtn} onPress={() => setTaskModalVisible(true)}>
-            <Text style={styles.addTaskText}>{t("dashAddReminderBtn")}</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Reminders Tab Selector */}
-        <View style={[styles.tabContainer, { backgroundColor: colors.tabBackground, borderColor: colors.border }]}>
-          <TouchableOpacity
-            style={[styles.tabButton, activeTab === "active" && styles.tabButtonActive]}
-            onPress={() => setActiveTab("active")}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.tabButtonText, activeTab === "active" && styles.tabButtonTextActive, { color: activeTab === "active" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("dashTabActive")} ({tasks.filter(t => t.status === "pending").length})
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.tabButton, activeTab === "history" && styles.tabButtonActive]}
-            onPress={() => setActiveTab("history")}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.tabButtonText, activeTab === "history" && styles.tabButtonTextActive, { color: activeTab === "history" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("dashTabHistory")} ({tasks.filter(t => t.status === "completed").length})
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        {activeTab === "active" ? (
-          /* Active Reminders List */
-          tasks.filter(t => t.status === "pending").length === 0 ? (
-            <View style={[styles.emptyChoreBox, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Text style={styles.emptyChoreEmoji}>🎉</Text>
-              <Text style={[styles.emptyChoreText, { color: colors.text }]}>{t("dashEmptyActiveTitle")}</Text>
-              <Text style={[styles.emptyChoreSubText, { color: colors.inactiveText }]}>{t("dashEmptyActiveSub")}</Text>
-            </View>
-          ) : (
-            <View style={styles.tasksList}>
-              {tasks.filter(t => t.status === "pending").map((item) => (
-                <TouchableOpacity
-                  key={item.id}
-                  style={[styles.taskCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                  onPress={() => {
-                    setSelectedTask(item);
-                    setEditTaskTitle(item.title);
-                    setEditTaskDate(item.dueDate ? new Date(item.dueDate) : new Date());
-                    setEditTaskAllDay(item.isAllDay ?? true);
-                    setEditTaskRemind(item.remindTiming ?? "at_time");
-                    setEditTaskRecurrence(item.recurrence ?? "none");
-                    setEditTaskStatus(item.status);
-                    if (item.dueTime) {
-                      const [h, m] = item.dueTime.split(":").map(Number);
-                      const d = new Date();
-                      d.setHours(h, m, 0, 0);
-                      setEditTaskTime(d);
-                    } else {
-                      setEditTaskTime(new Date());
-                    }
-                    setEditModalVisible(true);
-                  }}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.taskCardMain}>
-                    <Text style={[styles.taskTitle, { color: colors.text }]}>{item.title}</Text>
-                    <View style={styles.taskInfoRow}>
-                      <Text style={[styles.taskDueDate, { color: colors.subtitle }]}>
-                        📅 {item.dueDate ? new Date(item.dueDate).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US") : "No Date"} 
-                        {item.isAllDay ? (lang === "zh" ? " (全天)" : " (All Day)") : ` @ ${item.dueTime}`}
-                      </Text>
-                      {item.remindTiming && item.remindTiming !== "none" && (
-                        <Text style={styles.notificationBadge}>{t("dashAlertTitle")}</Text>
-                      )}
-                      {item.recurrence && item.recurrence !== "none" && (
-                        <Text style={[styles.notificationBadge, { backgroundColor: "#34C759" }]}>
-                          🔁 {item.recurrence === "daily" ? (lang === "zh" ? "每天" : "Daily") : 
-                              item.recurrence === "weekly" ? (lang === "zh" ? "每周" : "Weekly") : 
-                              (lang === "zh" ? "每月" : "Monthly")}
-                        </Text>
-                      )}
-                    </View>
-                  </View>
-                  <TouchableOpacity
-                    style={styles.completeTaskBtn}
-                    onPress={() => handleCompleteReminder(item)}
-                  >
-                    <Text style={styles.completeTaskText}>{t("dashCompleteBtn")}</Text>
-                  </TouchableOpacity>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )
-        ) : (
-          /* History / Completed Reminders List */
-          tasks.filter(t => t.status === "completed").length === 0 ? (
-            <View style={[styles.emptyChoreBox, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Text style={styles.emptyChoreEmoji}>⏰</Text>
-              <Text style={[styles.emptyChoreText, { color: colors.text }]}>{t("dashEmptyHistoryTitle")}</Text>
-              <Text style={[styles.emptyChoreSubText, { color: colors.inactiveText }]}>{t("dashEmptyHistorySub")}</Text>
-            </View>
-          ) : (
-            <View style={styles.tasksList}>
-              {tasks.filter(t => t.status === "completed").map((item) => (
-                <TouchableOpacity
-                  key={item.id}
-                  style={[styles.taskCard, styles.completedTaskCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                  onPress={() => {
-                    setSelectedTask(item);
-                    setEditTaskTitle(item.title);
-                    setEditTaskDate(item.dueDate ? new Date(item.dueDate) : new Date());
-                    setEditTaskAllDay(item.isAllDay ?? true);
-                    setEditTaskRemind(item.remindTiming ?? "at_time");
-                    setEditTaskRecurrence(item.recurrence ?? "none");
-                    setEditTaskStatus(item.status);
-                    if (item.dueTime) {
-                      const [h, m] = item.dueTime.split(":").map(Number);
-                      const d = new Date();
-                      d.setHours(h, m, 0, 0);
-                      setEditTaskTime(d);
-                    } else {
-                      setEditTaskTime(new Date());
-                    }
-                    setEditModalVisible(true);
-                  }}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.taskCardMain}>
-                    <Text style={[styles.taskTitle, styles.completedTaskTitle]}>{item.title}</Text>
-                    <View style={styles.taskInfoRow}>
-                      <Text style={styles.taskCompletedBy}>
-                        ✅ {lang === "zh" ? "由" : "Done by "}{item.completedBy === currentUser?.uid ? (lang === "zh" ? "你" : "You") : (lang === "zh" ? "伴侣" : "Partner")}{lang === "zh" ? "完成" : ""}
-                      </Text>
-                      {item.recurrence && item.recurrence !== "none" && (
-                        <Text style={[styles.notificationBadge, { backgroundColor: "#34C759" }]}>
-                          🔁 {item.recurrence === "daily" ? (lang === "zh" ? "每天" : "Daily") : 
-                              item.recurrence === "weekly" ? (lang === "zh" ? "每周" : "Weekly") : 
-                              (lang === "zh" ? "每月" : "Monthly")}
-                        </Text>
-                      )}
-                    </View>
-                  </View>
-                  <TouchableOpacity
-                    style={styles.restoreTaskBtn}
-                    onPress={() => handleRestoreReminder(item)}
-                  >
-                    <Text style={styles.restoreTaskText}>{t("dashRestoreBtn")}</Text>
-                  </TouchableOpacity>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )
-        )}
-
+        <NudgeBar
+          colors={colors}
+          lang={lang}
+          t={t}
+          onSend={(payload) => handleSendNudge(payload)}
+        />
+        {/* Reminders / Chores Section */}
+        <ReminderList
+          colors={colors}
+          lang={lang}
+          t={t}
+          activeTab={activeTab}
+          pendingTasks={tasks.filter((x) => x.status === "pending")}
+          completedTasks={tasks.filter((x) => x.status === "completed")}
+          currentUserId={currentUser?.uid ?? null}
+          onTabChange={setActiveTab}
+          onAddReminder={() => setTaskModalVisible(true)}
+          onOpenTask={openTask}
+          onCompleteTask={handleCompleteReminder}
+          onRestoreTask={handleRestoreReminder}
+        />
       </ScrollView>
 
       {/* Task Creation Modal */}
@@ -1685,7 +1361,7 @@ export default function DashboardScreen() {
               <View style={styles.dashboardCodeBox}>
                 <Text style={styles.dashboardCodeLabel}>{t("pairYourCode")}</Text>
                 <Text style={styles.dashboardCodeText} numberOfLines={1} ellipsizeMode="middle">
-                  {currentUser?.uid}
+                  {inviteLoading ? t("pairLoading") : inviteCode ?? t("pairInvalidCode")}
                 </Text>
                 <View style={styles.dashboardCodeActions}>
                   <TouchableOpacity style={styles.dashboardCodeBtn} onPress={copyToClipboard}>
@@ -1708,8 +1384,8 @@ export default function DashboardScreen() {
                 placeholder={t("pairPlaceholder")}
                 placeholderTextColor="#606580"
                 value={partnerCode}
-                onChangeText={setPartnerCode}
-                autoCapitalize="none"
+                onChangeText={(value) => setPartnerCode(value.toUpperCase())}
+                autoCapitalize="characters"
                 autoCorrect={false}
                 returnKeyType="done"
                 onSubmitEditing={handleConnectPartner}

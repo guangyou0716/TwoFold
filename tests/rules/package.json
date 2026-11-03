@@ -1,0 +1,16 @@
+{
+  "name": "twofold-rules-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Firestore + Storage emulator rule tests. Isolated from the app so it can pin firebase v10.",
+  "scripts": {
+    "test": "node --test ./"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "3.0.4",
+    "firebase": "10.14.1"
+  },
+  "dependencies": {
+    "firebase-tools": "^15.28.1"
+  }
+}

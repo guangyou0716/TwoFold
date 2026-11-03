@@ -1,16 +1,17 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { View, ActivityIndicator, StyleSheet, LogBox } from "react-native";
+import * as Notifications from "expo-notifications";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
-import { onAuthStateChanged, User } from "firebase/auth";
-import { doc, onSnapshot } from "firebase/firestore";
-import { auth, db } from "../../firebaseConfig";
+import { onAuthStateChanged, signOut, User } from "firebase/auth";
+import { auth } from "../../firebaseConfig";
 import { RootStackParamList, HomeTabParamList } from "../types";
 import { StatusBar } from "expo-status-bar";
-
-LogBox.ignoreLogs(["expo-notifications"]);
-
-// Import Screens
+import { useTheme } from "../theme";
+import { useUserProfile } from "../hooks/useUserProfile";
+import { ErrorState } from "../components/primitives/ErrorState";
+import { GlassTabBar } from "./GlassTabBar";
+import type { UserProfile } from "../types";
 import WelcomeScreen from "../screens/WelcomeScreen";
 import AuthScreen from "../screens/AuthScreen";
 import PairingScreen from "../screens/PairingScreen";
@@ -19,111 +20,35 @@ import BudgetScreen from "../screens/BudgetScreen";
 import MemoryCapsuleScreen from "../screens/MemoryCapsuleScreen";
 import SettingsScreen from "../screens/SettingsScreen";
 
+LogBox.ignoreLogs(["expo-notifications"]);
+
 const Stack = createNativeStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<HomeTabParamList>();
 
-// Bottom Tabs Navigator
-function HomeTabNavigator() {
-  const currentUser = auth.currentUser;
-  const [themePreference, setThemePreference] = useState<"dark" | "light">("dark");
-  const [languagePreference, setLanguagePreference] = useState<"en" | "zh">("en");
+// Bottom Tabs Navigator — uses the L2 glass dock instead of colored dots.
+function HomeTabNavigator({ profile }: { profile: UserProfile | null }) {
+  const { tokens } = useTheme();
+  const lang = profile?.languagePreference ?? "en";
 
-  useEffect(() => {
-    if (!currentUser) return;
-    const unsub = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
-      const data = snap.data();
-      if (data?.themePreference) {
-        setThemePreference(data.themePreference);
-      }
-      if (data?.languagePreference) {
-        setLanguagePreference(data.languagePreference);
-      }
-    }, (error) => {
-      console.log("[RootNavigator] HomeTabNavigator profile deleted or unauthorized:", error.message);
-    });
-    return unsub;
-  }, [currentUser]);
-
-  const isDark = themePreference !== "light";
-  const colors = {
-    tabBarBg: isDark ? "#131520" : "#FFFFFF",
-    tabBarBorder: isDark ? "rgba(255, 255, 255, 0.05)" : "rgba(0, 0, 0, 0.05)",
-    inactiveTint: isDark ? "#606580" : "#A0A5C0",
+  const tabLabels: Record<keyof HomeTabParamList, string> = {
+    Dashboard: lang === "zh" ? "首页" : "Home",
+    Budget: lang === "zh" ? "记账" : "Budget",
+    MemoryCapsule: lang === "zh" ? "记忆" : "Memories",
+    Settings: lang === "zh" ? "设置" : "Settings",
   };
-
-  const tabHome = languagePreference === "zh" ? "首页" : "Home";
-  const tabBudget = languagePreference === "zh" ? "记账" : "Budget";
-  const tabMemories = languagePreference === "zh" ? "记忆" : "Memories";
-  const tabSettings = languagePreference === "zh" ? "设置" : "Settings";
 
   return (
     <Tab.Navigator
+      tabBar={(props) => <GlassTabBar {...props} />}
       screenOptions={{
         headerShown: false,
-        tabBarStyle: {
-          backgroundColor: colors.tabBarBg,
-          borderTopWidth: 1,
-          borderTopColor: colors.tabBarBorder,
-          height: 64,
-          paddingBottom: 10,
-          paddingTop: 8,
-        },
-        tabBarActiveTintColor: "#FF5E7E",
-        tabBarInactiveTintColor: colors.inactiveTint,
-        tabBarLabelStyle: {
-          fontSize: 11,
-          fontWeight: "600",
-        },
+        tabBarStyle: { backgroundColor: tokens.colors.surface },
       }}
     >
-      <Tab.Screen
-        name="Dashboard"
-        component={DashboardScreen}
-        options={{
-          tabBarLabel: tabHome,
-          tabBarIcon: ({ color, focused }) => (
-            <View style={[styles.tabIcon, focused && styles.tabIconActive]}>
-              <View style={[styles.dot, { backgroundColor: color }]} />
-            </View>
-          ),
-        }}
-      />
-      <Tab.Screen
-        name="Budget"
-        component={BudgetScreen}
-        options={{
-          tabBarLabel: tabBudget,
-          tabBarIcon: ({ color, focused }) => (
-            <View style={[styles.tabIcon, focused && styles.tabIconActive]}>
-              <View style={[styles.dot, { backgroundColor: color }]} />
-            </View>
-          ),
-        }}
-      />
-      <Tab.Screen
-        name="MemoryCapsule"
-        component={MemoryCapsuleScreen}
-        options={{
-          tabBarLabel: tabMemories,
-          tabBarIcon: ({ color, focused }) => (
-            <View style={[styles.tabIcon, focused && styles.tabIconActive]}>
-              <View style={[styles.dot, { backgroundColor: color }]} />
-            </View>
-          ),
-        }}
-      />
-      <Tab.Screen
-        name="Settings"
-        component={SettingsScreen}
-        options={{
-          tabBarLabel: tabSettings,
-          tabBarIcon: ({ color, focused }) => (
-            <View style={[styles.tabIcon, focused && styles.tabIconActive]}>
-              <View style={[styles.dot, { backgroundColor: color }]} />
-            </View>
-          ),
-        }}
-      />
+      <Tab.Screen name="Dashboard" component={DashboardScreen} options={{ tabBarLabel: tabLabels.Dashboard }} />
+      <Tab.Screen name="Budget" component={BudgetScreen} options={{ tabBarLabel: tabLabels.Budget }} />
+      <Tab.Screen name="MemoryCapsule" component={MemoryCapsuleScreen} options={{ tabBarLabel: tabLabels.MemoryCapsule }} />
+      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarLabel: tabLabels.Settings }} />
     </Tab.Navigator>
   );
 }
@@ -131,78 +56,93 @@ function HomeTabNavigator() {
 // Root Navigator
 export default function RootNavigator() {
   const [initializing, setInitializing] = useState(true);
-  const [user, setUser] = useState<User | null>(null);    // Fixed: typed as User | null instead of any
-  const [hasGroup, setHasGroup] = useState(false);
-  const [loadingProfile, setLoadingProfile] = useState(true); // Fixed: initialize to true to prevent race flash
-  const [themePreference, setThemePreference] = useState<"dark" | "light">("dark");
+  const [user, setUser] = useState<User | null>(null);
+  const { profile, loading: loadingProfile, error: profileError } = useUserProfile(user);
+  const { tokens, scheme, setPreference } = useTheme();
+
+  const previousUserId = useRef<string | null>(null);
+  const previousGroupId = useRef<string | null>(null);
 
   useEffect(() => {
     const unsubscribeAuth = onAuthStateChanged(auth, (authUser) => {
       setUser(authUser);
-      if (!authUser) {
-        // If signed out, immediately clear loading states
-        setLoadingProfile(false);
-        setHasGroup(false);
-      }
       setInitializing(false);
     });
-
     return unsubscribeAuth;
   }, []);
 
-  // Listen to Firestore profile to check pairing status when user is authenticated
+  // Drop device-local reminder alarms when this phone signs out, or when a
+  // shared group becomes a private solo group (unlink / partner account delete).
+  // The first paint has no previous id, so a cold start does not cancel alarms.
   useEffect(() => {
-    if (!user) return;
-
-    setLoadingProfile(true);
-    const unsubscribeProfile = onSnapshot(
-      doc(db, "users", user.uid),
-      (docSnap) => {
-        if (docSnap.exists()) {
-          const profileData = docSnap.data();
-          // User has access if they are paired or playing solo (any groupId)
-          setHasGroup(!!profileData?.groupId);
-          if (profileData?.themePreference) {
-            setThemePreference(profileData.themePreference);
-          }
-        } else {
-          setHasGroup(false);
-        }
-        setLoadingProfile(false);
-      },
-      (error) => {
-        console.error("[RootNavigator] Error fetching user profile:", error);
-        setLoadingProfile(false);
-      }
-    );
-
-    return unsubscribeProfile;
+    const nextUserId = user?.uid ?? null;
+    if (previousUserId.current && !nextUserId) {
+      void Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
+    }
+    previousUserId.current = nextUserId;
   }, [user]);
 
-  if (initializing || loadingProfile) {
+  useEffect(() => {
+    // Ignore the null profile while auth or the user doc is reloading. Cancelling
+    // on that gap would wipe alarms every time the auth user object changes.
+    if (!profile) return;
+    const nextGroupId = profile.groupId ?? "";
+    const prev = previousGroupId.current;
+    const leftSharedGroup = !!prev
+      && prev.startsWith("group_")
+      && (nextGroupId.startsWith("solo_") || nextGroupId === "");
+    if (leftSharedGroup) {
+      void Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
+    }
+    previousGroupId.current = nextGroupId || null;
+  }, [profile]);
+
+  // Seed theme preference from Firestore profile once available.
+  useEffect(() => {
+    if (profile?.themePreference) {
+      setPreference(profile.themePreference);
+    }
+  }, [profile?.themePreference, setPreference]);
+
+  if (initializing || (user && loadingProfile)) {
     return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#FF5E7E" />
+      <View style={[styles.loadingContainer, { backgroundColor: tokens.colors.canvas }]}>
+        <ActivityIndicator size="large" color={tokens.colors.accent} />
       </View>
     );
   }
 
+  // Authenticated but profile missing/forbidden → recoverable error, not a hang.
+  if (user && profileError) {
+    return (
+      <View style={[styles.loadingContainer, { backgroundColor: tokens.colors.canvas }]}>
+        <ErrorState
+          title="Profile unavailable"
+          message="We couldn't load your profile. Please sign out and back in."
+          retryLabel="Sign out"
+          onRetry={() => signOut(auth)}
+        />
+      </View>
+    );
+  }
+
+  const hasGroup = !!profile?.groupId;
+
   return (
     <>
-      <StatusBar style={themePreference === "light" ? "dark" : "light"} />
+      <StatusBar style={scheme === "light" ? "dark" : "light"} />
       <Stack.Navigator screenOptions={{ headerShown: false }}>
         {!user ? (
-          // Auth Stack — unauthenticated users
           <>
             <Stack.Screen name="Welcome" component={WelcomeScreen} />
             <Stack.Screen name="Auth" component={AuthScreen} />
           </>
         ) : !hasGroup ? (
-          // Pairing Stack — authenticated but not yet linked with a group/partner
           <Stack.Screen name="Pairing" component={PairingScreen} />
         ) : (
-          // Main App — authenticated and has a group (paired or solo)
-          <Stack.Screen name="HomeTabs" component={HomeTabNavigator} />
+          <Stack.Screen name="HomeTabs">
+            {() => <HomeTabNavigator profile={profile} />}
+          </Stack.Screen>
         )}
       </Stack.Navigator>
     </>
@@ -212,23 +152,7 @@ export default function RootNavigator() {
 const styles = StyleSheet.create({
   loadingContainer: {
     flex: 1,
-    backgroundColor: "#0A0B10",
     justifyContent: "center",
     alignItems: "center",
-  },
-  tabIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  tabIconActive: {
-    backgroundColor: "rgba(255, 94, 126, 0.12)",
-  },
-  dot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
   },
 });
