@@ -3,6 +3,7 @@ import { initializeApp, getApps, getApp } from "firebase/app";
 import { initializeAuth, getAuth, getReactNativePersistence, connectAuthEmulator } from "firebase/auth";
 import { getFirestore, connectFirestoreEmulator } from "firebase/firestore";
 import { getStorage, connectStorageEmulator } from "firebase/storage";
+import { getFunctions, connectFunctionsEmulator } from "firebase/functions";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
 
@@ -38,6 +39,7 @@ const auth = isNewApp
 
 const db = getFirestore(app);
 const storage = getStorage(app);
+const functions = getFunctions(app);
 
 // ---------------------------------------------------------------------------
 // Local Firebase Emulator Suite
@@ -58,10 +60,11 @@ if (USE_EMULATORS && !emulatorsConnected) {
     connectAuthEmulator(auth, `http://${host}:9099`, { disableWarnings: false });
     connectFirestoreEmulator(db, host, 8080);
     connectStorageEmulator(storage, host, 9199);
-    console.info("[Firebase] ✅ All 3 emulators connected (Auth:9099, Firestore:8080, Storage:9199)");
+    connectFunctionsEmulator(functions, host, 5001);
+    console.info("[Firebase] ✅ 4 emulators connected (Auth:9099, Firestore:8080, Storage:9199, Functions:5001)");
   } catch (error) {
     console.warn("[Firebase] ⚠️  Emulator connection failed (may already be connected):", error);
   }
 }
 
-export { app, auth, db, storage };
+export { app, auth, db, storage, functions };

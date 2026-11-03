@@ -1,7 +1,11 @@
 import React from "react";
-import { LogBox } from "react-native";
+import { LogBox, View, StyleSheet } from "react-native";
 import { NavigationContainer } from "@react-navigation/native";
+import { SafeAreaProvider } from "react-native-safe-area-context";
+import { ThemeProvider } from "./src/theme";
 import RootNavigator from "./src/navigation/RootNavigator";
+import { ErrorBoundary } from "./src/components/primitives/ErrorBoundary";
+import { ConnectionBanner } from "./src/components/primitives/ConnectionBanner";
 
 // Suppress Expo Go notifications warnings in both the UI overlay and Metro console
 LogBox.ignoreLogs([
@@ -12,8 +16,21 @@ LogBox.ignoreLogs([
 
 export default function App() {
   return (
-    <NavigationContainer>
-      <RootNavigator />
-    </NavigationContainer>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <ThemeProvider>
+          <View style={styles.root}>
+            <NavigationContainer>
+              <RootNavigator />
+            </NavigationContainer>
+            <ConnectionBanner />
+          </View>
+        </ThemeProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
+
+const styles = StyleSheet.create({
+  root: { flex: 1 },
+});

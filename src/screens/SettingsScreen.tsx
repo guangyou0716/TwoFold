@@ -5,19 +5,26 @@ import {
   View,
   ScrollView,
   TouchableOpacity,
-  TextInput,
   Alert,
-  ActivityIndicator,
   Modal,
   Share
 } from "react-native";
 import { policyText } from "../utils/policyText";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { doc, onSnapshot, updateDoc, writeBatch, deleteDoc, collection, query, where, getDocs, getDoc } from "firebase/firestore";
-import { signOut, deleteUser, updatePassword } from "firebase/auth";
-import { auth, db } from "../../firebaseConfig";
+import { doc, onSnapshot, updateDoc } from "firebase/firestore";
+import { signOut, updatePassword } from "firebase/auth";
+import { httpsCallable } from "firebase/functions";
+import * as Notifications from "expo-notifications";
+import { auth, db, functions } from "../../firebaseConfig";
 import { UserProfile } from "../types";
 import { translations } from "../utils/translations";
+import {
+  ProfileCard,
+  PasswordCard,
+  PreferencesCard,
+  RelationshipCard,
+  DangerZone,
+} from "../features/settings/components";
 
 const CURRENCIES = ["$", "€", "£", "¥", "RM", "NT$", "HK$"];
 
@@ -163,25 +170,11 @@ export default function SettingsScreen() {
           onPress: async () => {
             setUpdating(true);
             try {
-              const batch = writeBatch(db);
-
-              // 1. Reset own profile
-              batch.update(doc(db, "users", currentUser.uid), {
-                partnerId: "",
-                groupId: "",
-                isSolo: true
-              });
-
-              // 2. Reset partner's profile if linked
-              if (userProfile.partnerId) {
-                batch.update(doc(db, "users", userProfile.partnerId), {
-                  partnerId: "",
-                  groupId: "",
-                  isSolo: true
-                });
-              }
-
-              await batch.commit();
+              // The callable copies a private snapshot for each partner, then
+              // drops the shared group. Clients cannot retarget groupId.
+              const unlink = httpsCallable(functions, "unlinkPartner");
+              await unlink();
+              await Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
               Alert.alert(t("unlinkSuccessTitle"), t("unlinkSuccessMsg"));
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : "Unknown error";
@@ -235,44 +228,12 @@ export default function SettingsScreen() {
           onPress: async () => {
             setUpdating(true);
             try {
-              const batch = writeBatch(db);
-
-              // 1. If partnered: Unlink from partner if currently linked
-              if (userProfile?.partnerId && !userProfile.isSolo) {
-                batch.update(doc(db, "users", userProfile.partnerId), {
-                  partnerId: "",
-                  groupId: "",
-                  isSolo: true
-                });
-              }
-
-              // 2. If solo: Purge all associated tasks, transactions, milestones, memories, savings_goals
-              if (userProfile?.isSolo && userProfile.groupId) {
-                const soloGroupId = userProfile.groupId;
-                const collectionsToPurge = ["tasks", "transactions", "milestones", "memories", "savings_goals"];
-
-                for (const colName of collectionsToPurge) {
-                  const qSnap = await getDocs(
-                    query(collection(db, colName), where("groupId", "==", soloGroupId))
-                  );
-                  qSnap.forEach((docSnap) => {
-                    batch.delete(docSnap.ref);
-                  });
-                }
-
-                // Also delete the group document itself
-                batch.delete(doc(db, "groups", soloGroupId));
-              }
-
-              // 3. Delete own Firestore document
-              batch.delete(doc(db, "users", currentUser.uid));
-              await batch.commit();
-
-              // 4. Delete Firebase Auth user account
-              await deleteUser(currentUser);
+              const startAccountJob = httpsCallable<{ type: "delete" }, { jobId: string }>(functions, "startAccountJob");
+              await startAccountJob({ type: "delete" });
+              await signOut(auth);
             } catch (err: any) {
               console.error("[Settings] Account deletion failed:", err);
-              if (err.code === "auth/requires-recent-login") {
+              if (err.code === "auth/requires-recent-login" || err.message?.includes("RECENT_LOGIN_REQUIRED")) {
                 Alert.alert(
                   lang === "zh" ? "需要重新登录" : "Authentication Required",
                   lang === "zh"
@@ -296,68 +257,21 @@ export default function SettingsScreen() {
     if (!currentUser || !userProfile) return;
     setUpdating(true);
     try {
-      const exportObject: any = {
-        exportedAt: new Date().toISOString(),
-        userProfile: {
-          uid: userProfile.uid,
-          displayName: userProfile.displayName,
-          email: userProfile.email,
-          createdAt: userProfile.createdAt,
-          isSolo: userProfile.isSolo ?? false,
-          themePreference: userProfile.themePreference ?? "dark",
-          currencyPreference: userProfile.currencyPreference ?? "$",
-          timezoneLocation: userProfile.timezoneLocation ?? "device",
-          languagePreference: userProfile.languagePreference ?? "en",
-        },
-      };
-
-      const groupId = userProfile.groupId;
-      if (groupId) {
-        // Query group profile
-        const groupDoc = await getDoc(doc(db, "groups", groupId));
-        if (groupDoc.exists()) {
-          exportObject.groupProfile = groupDoc.data();
-        }
-
-        // Query transactions
-        const txSnap = await getDocs(
-          query(collection(db, "transactions"), where("groupId", "==", groupId))
-        );
-        exportObject.transactions = txSnap.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        }));
-
-        // Query tasks
-        const tasksSnap = await getDocs(
-          query(collection(db, "tasks"), where("groupId", "==", groupId))
-        );
-        exportObject.tasks = tasksSnap.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        }));
-
-        // Query milestones
-        const milestonesSnap = await getDocs(
-          query(collection(db, "milestones"), where("groupId", "==", groupId))
-        );
-        exportObject.milestones = milestonesSnap.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        }));
-
-        // Query savings goals
-        const savingsSnap = await getDocs(
-          query(collection(db, "savings_goals"), where("groupId", "==", groupId))
-        );
-        exportObject.savingsGoals = savingsSnap.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        }));
+      const startAccountJob = httpsCallable<{ type: "export" }, { jobId: string }>(functions, "startAccountJob");
+      const getJobStatus = httpsCallable<{ jobId: string }, { status: string; manifest?: unknown; error?: string }>(functions, "getJobStatus");
+      const { data: started } = await startAccountJob({ type: "export" });
+      let status: { status: string; manifest?: unknown; error?: string } | null = null;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const result = await getJobStatus({ jobId: started.jobId });
+        status = result.data;
+        if (status.status === "complete" || status.status === "error") break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (!status || status.status !== "complete") {
+        throw new Error(status?.error || "Export is still processing. Please try again shortly.");
       }
 
-      // Convert to formatted JSON string
-      const jsonString = JSON.stringify(exportObject, null, 2);
+      const jsonString = JSON.stringify(status.manifest ?? {}, null, 2);
 
       // Open React Native Share sheet
       await Share.share({
@@ -438,265 +352,66 @@ export default function SettingsScreen() {
         </View>
 
         {/* Profile Settings */}
-        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.cardTitle, { color: colors.text }]}>{t("settingsProfileOptions")}</Text>
-          
-          <Text style={[styles.label, { color: colors.subtitle }]}>{t("settingsDisplayName")}</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)", color: colors.text, borderColor: colors.border }]}
-            value={newName}
-            onChangeText={setNewName}
-            placeholder={t("authYourName")}
-            placeholderTextColor={colors.inactiveText}
-            maxLength={30}
-          />
-
-          <TouchableOpacity
-            style={[styles.submitBtn, updating && styles.disabledBtn]}
-            onPress={handleUpdateName}
-            disabled={updating}
-          >
-            {updating ? (
-              <ActivityIndicator color="#ffffff" size="small" />
-            ) : (
-              <Text style={styles.submitBtnText}>{t("settingsSaveDisplayName")}</Text>
-            )}
-          </TouchableOpacity>
-        </View>
-
+        <ProfileCard
+          colors={colors}
+          isDark={isDark}
+          t={t}
+          value={newName}
+          onChangeText={setNewName}
+          onSave={handleUpdateName}
+          updating={updating}
+        />
         {/* Change Password Card */}
-        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <TouchableOpacity 
-            style={styles.accordionHeader} 
-            onPress={() => setPasswordChangeOpen(!passwordChangeOpen)}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.cardTitle, { color: colors.text, marginBottom: 0 }]}>
-              {t("settingsChangePassword")}
-            </Text>
-            <Text style={{ color: colors.subtitle, fontSize: 16 }}>
-              {passwordChangeOpen ? "▲" : "▼"}
-            </Text>
-          </TouchableOpacity>
-
-          {passwordChangeOpen && (
-            <View style={{ marginTop: 16 }}>
-              <Text style={[styles.label, { color: colors.subtitle }]}>{t("settingsNewPassword")}</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)", color: colors.text, borderColor: colors.border }]}
-                value={newPassword}
-                onChangeText={setNewPassword}
-                placeholder="••••••••"
-                placeholderTextColor={colors.inactiveText}
-                secureTextEntry={true}
-                autoCapitalize="none"
-              />
-
-              <Text style={[styles.label, { color: colors.subtitle, marginTop: 12 }]}>{t("settingsConfirmPassword")}</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)", color: colors.text, borderColor: colors.border }]}
-                value={confirmNewPassword}
-                onChangeText={setConfirmNewPassword}
-                placeholder="••••••••"
-                placeholderTextColor={colors.inactiveText}
-                secureTextEntry={true}
-                autoCapitalize="none"
-              />
-
-              <TouchableOpacity
-                style={[styles.submitBtn, passwordUpdating && styles.disabledBtn, { marginTop: 16 }]}
-                onPress={handleUpdatePassword}
-                disabled={passwordUpdating}
-              >
-                {passwordUpdating ? (
-                  <ActivityIndicator color="#ffffff" size="small" />
-                ) : (
-                  <Text style={styles.submitBtnText}>{t("settingsUpdatePasswordBtn")}</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
-
+        <PasswordCard
+          colors={colors}
+          isDark={isDark}
+          t={t}
+          open={passwordChangeOpen}
+          onToggle={() => setPasswordChangeOpen(!passwordChangeOpen)}
+          newPassword={newPassword}
+          onChangeNewPassword={setNewPassword}
+          confirmPassword={confirmNewPassword}
+          onChangeConfirmPassword={setConfirmNewPassword}
+          onSubmit={handleUpdatePassword}
+          updating={passwordUpdating}
+        />
         {/* Preferences Settings */}
-        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.cardTitle, { color: colors.text }]}>{t("settingsAppPreferences")}</Text>
-
-          {/* Language Selector */}
-          <Text style={[styles.label, { color: colors.subtitle }]}>{t("settingsLanguage")}</Text>
-          <View style={[styles.selectorRow, { marginBottom: 16 }]}>
-            <TouchableOpacity
-              style={[
-                styles.selectorBtn,
-                lang === "en" && styles.selectorBtnActive,
-                { borderColor: colors.border }
-              ]}
-              onPress={() => handleSelectLanguage("en")}
-            >
-              <Text style={[styles.selectorBtnText, lang === "en" && styles.selectorBtnTextActive, { color: lang === "en" ? "#FFFFFF" : colors.inactiveText }]}>
-                {t("settingsEnglish")}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.selectorBtn,
-                lang === "zh" && styles.selectorBtnActive,
-                { borderColor: colors.border }
-              ]}
-              onPress={() => handleSelectLanguage("zh")}
-            >
-              <Text style={[styles.selectorBtnText, lang === "zh" && styles.selectorBtnTextActive, { color: lang === "zh" ? "#FFFFFF" : colors.inactiveText }]}>
-                {t("settingsChinese")}
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Theme Selector */}
-          <Text style={[styles.label, { color: colors.subtitle }]}>{t("settingsThemeStyle")}</Text>
-          <View style={styles.selectorRow}>
-            <TouchableOpacity
-              style={[
-                styles.selectorBtn,
-                isDark && styles.selectorBtnActive,
-                { borderColor: colors.border }
-              ]}
-              onPress={() => handleToggleTheme("dark")}
-            >
-              <Text style={[styles.selectorBtnText, isDark && styles.selectorBtnTextActive, { color: isDark ? "#FFFFFF" : colors.inactiveText }]}>
-                {t("settingsDarkMode")}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.selectorBtn,
-                !isDark && styles.selectorBtnActive,
-                { borderColor: colors.border }
-              ]}
-              onPress={() => handleToggleTheme("light")}
-            >
-              <Text style={[styles.selectorBtnText, !isDark && styles.selectorBtnTextActive, { color: !isDark ? "#FFFFFF" : colors.inactiveText }]}>
-                {t("settingsLightMode")}
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Currency Selector */}
-          <Text style={[styles.label, { color: colors.subtitle, marginTop: 16 }]}>{t("settingsSharedCurrency")}</Text>
-          <View style={styles.currencyGrid}>
-            {CURRENCIES.map((curr) => {
-              const isActive = activeCurrency === curr;
-              return (
-                <TouchableOpacity
-                  key={curr}
-                  style={[
-                    styles.currBtn,
-                    isActive && styles.currBtnActive,
-                    { borderColor: colors.border }
-                  ]}
-                  onPress={() => handleSelectCurrency(curr)}
-                >
-                  <Text style={[styles.currBtnText, isActive && styles.currBtnTextActive, { color: isActive ? "#FFFFFF" : colors.text }]}>
-                    {curr}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-
-          {/* Location / Timezone Selector */}
-          <Text style={[styles.label, { color: colors.subtitle, marginTop: 16 }]}>{t("settingsReminderTimezone")}</Text>
-          <View style={styles.locationList}>
-            {localizedLocations.map((loc) => {
-              const isActive = (userProfile?.timezoneLocation ?? "device") === loc.value;
-              return (
-                <TouchableOpacity
-                  key={loc.value}
-                  style={[
-                    styles.locBtn,
-                    { backgroundColor: isDark ? "rgba(255,255,255,0.02)" : "rgba(0,0,0,0.02)", borderColor: colors.border },
-                    isActive && styles.locBtnActive
-                  ]}
-                  onPress={() => handleSelectLocation(loc.value)}
-                >
-                  <Text style={[styles.locBtnText, isActive && styles.locBtnTextActive, { color: isActive ? "#FFFFFF" : colors.text }]}>
-                    {loc.label}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        </View>
-
+        <PreferencesCard
+          colors={colors}
+          isDark={isDark}
+          t={t}
+          lang={lang}
+          activeCurrency={activeCurrency}
+          currencies={CURRENCIES}
+          timezone={userProfile?.timezoneLocation}
+          locations={localizedLocations}
+          onSelectLanguage={handleSelectLanguage}
+          onToggleTheme={handleToggleTheme}
+          onSelectCurrency={handleSelectCurrency}
+          onSelectLocation={handleSelectLocation}
+        />
         {/* Account Pairing Status */}
-        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.cardTitle, { color: colors.text }]}>{t("settingsRelationshipStatus")}</Text>
-          {userProfile?.isSolo ? (
-            <View style={styles.statusBox}>
-              <Text style={[styles.statusText, { color: colors.text }]}>{t("settingsSoloActive")}</Text>
-              <Text style={[styles.statusSubText, { color: colors.subtitle }]}>
-                {t("settingsSoloSub")}
-              </Text>
-            </View>
-          ) : (
-            <View style={styles.statusBox}>
-              <Text style={[styles.statusText, { color: colors.text }]}>
-                {t("settingsConnectedWithPartner")}{partnerProfile?.displayName ?? "Your Partner"}
-              </Text>
-              <Text style={[styles.statusSubText, { color: colors.subtitle }]}>
-                {t("settingsConnectedSub")}
-              </Text>
-              <TouchableOpacity
-                style={styles.unlinkBtn}
-                onPress={handleUnlinkPartner}
-                disabled={updating}
-              >
-                <Text style={styles.unlinkBtnText}>{t("settingsUnlinkBtn")}</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
+        <RelationshipCard
+          colors={colors}
+          t={t}
+          isSolo={!!userProfile?.isSolo}
+          partnerName={partnerProfile?.displayName ?? null}
+          onUnlink={handleUnlinkPartner}
+          updating={updating}
+        />
 
-         {/* Logout */}
-        <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
-          <Text style={styles.logoutBtnText}>{t("settingsLogoutBtn")}</Text>
-        </TouchableOpacity>
-
-        {/* Export Personal Data (GDPR Compliance) */}
-        <TouchableOpacity 
-          style={[styles.exportDataBtn, { borderColor: colors.border }]} 
-          onPress={handleExportData}
-          disabled={updating}
-        >
-          <Text style={[styles.exportDataBtnText, { color: colors.subtitle }]}>
-            {t("settingsExportDataBtn")}
-          </Text>
-        </TouchableOpacity>
-
-        {/* Delete Account (Apple Compliance) */}
-        <TouchableOpacity 
-          style={[styles.deleteAccountBtn, { borderColor: isDark ? "rgba(255,59,48,0.15)" : "rgba(255,59,48,0.1)" }]} 
-          onPress={handleDeleteAccount}
-          disabled={updating}
-        >
-          {updating ? (
-            <ActivityIndicator color="#FF3B30" size="small" />
-          ) : (
-            <Text style={styles.deleteAccountBtnText}>
-              {lang === "zh" ? "⚠️ 永久注销账户" : "⚠️ Permanently Delete Account"}
-            </Text>
-          )}
-        </TouchableOpacity>
-
-        {/* Privacy Policy Recap */}
-        <TouchableOpacity 
-          style={[styles.policyBtn, { borderColor: colors.border }]} 
-          onPress={() => setPolicyVisible(true)}
-        >
-          <Text style={[styles.policyBtnText, { color: colors.subtitle }]}>
-            {lang === "zh" ? "📄 查看服务条款 & 隐私政策" : "📄 View Terms & Privacy Policy"}
-          </Text>
-        </TouchableOpacity>
-
+        {/* Logout / Data & account actions */}
+        <DangerZone
+          colors={colors}
+          isDark={isDark}
+          t={t}
+          lang={lang}
+          updating={updating}
+          onLogout={handleLogout}
+          onExport={handleExportData}
+          onDelete={handleDeleteAccount}
+          onOpenPolicy={() => setPolicyVisible(true)}
+        />
       </ScrollView>
 
       {/* Scrollable Privacy Policy Modal */}

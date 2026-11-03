@@ -60,6 +60,7 @@ export interface Transaction {
   date: string; // YYYY-MM-DD
   createdAt: string;
   recurrence?: "none" | "monthly";
+  recurrenceId?: string;
   isTemplate?: boolean; // If true, this is a hotkey template, not a transaction log
   nextTriggerDate?: string; // For recurring transactions: YYYY-MM-DD
 }
@@ -79,6 +80,7 @@ export interface Memory {
   groupId: string;
   type: "video" | "image" | "text";
   mediaUrl?: string | null;
+  mediaPath?: string | null;
   textContent: string;
   uploadedBy: string;
   createdAt: string;

@@ -15,9 +15,10 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import * as Clipboard from "expo-clipboard";
-import { writeBatch, doc, getDoc, setDoc, onSnapshot, runTransaction } from "firebase/firestore";
+import { writeBatch, doc, onSnapshot } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
 import { signOut } from "firebase/auth";
-import { auth, db } from "../../firebaseConfig";
+import { auth, db, functions } from "../../firebaseConfig";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types";
 import { translations } from "../utils/translations";
@@ -30,6 +31,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
   const currentUser = auth.currentUser;
   const [languagePreference, setLanguagePreference] = useState<"en" | "zh">("en");
   const [partnerCode, setPartnerCode] = useState("");
+  const [inviteCode, setInviteCode] = useState<string | null>(null);
+  const [inviteLoading, setInviteLoading] = useState(true);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -46,6 +49,29 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
       console.log("[Pairing] User profile listener error:", error.message);
     });
     return unsub;
+  }, [currentUser]);
+
+  useEffect(() => {
+    let active = true;
+    const loadInvite = async () => {
+      if (!currentUser) return;
+      setInviteLoading(true);
+      try {
+        const createInvite = httpsCallable<undefined, { code: string }>(functions, "createInvite");
+        const result = await createInvite();
+        if (active) setInviteCode(result.data.code);
+      } catch (error) {
+        console.error("[Pairing] Invite creation failed:", error);
+        if (active) setInviteCode(null);
+      } finally {
+        if (active) setInviteLoading(false);
+      }
+    };
+
+    void loadInvite();
+    return () => {
+      active = false;
+    };
   }, [currentUser]);
 
   const lang = languagePreference;
@@ -67,8 +93,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
   // This avoids the double-redirect race condition.
 
   const copyToClipboard = async () => {
-    if (!currentUser) return;
-    await Clipboard.setStringAsync(currentUser.uid);
+    if (!inviteCode) return;
+    await Clipboard.setStringAsync(inviteCode);
     setCopied(true);
     if (copyTimeoutRef.current) {
       clearTimeout(copyTimeoutRef.current);
@@ -79,10 +105,10 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
   };
 
   const shareCode = async () => {
-    if (!currentUser) return;
+    if (!inviteCode) return;
     try {
       await Share.share({
-        message: t("pairShareMsg").replace("{code}", currentUser.uid),
+        message: t("pairShareMsg").replace("{code}", inviteCode),
         title: t("pairShareTitle"),
       });
     } catch {
@@ -99,72 +125,10 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
       return;
     }
 
-    if (cleanedCode === currentUser.uid) {
-      Alert.alert(t("pairSelfLinking"), t("pairSelfLinkingMsg"));
-      return;
-    }
-
     setLoading(true);
     try {
-      const myDocRef = doc(db, "users", currentUser.uid);
-      const partnerDocRef = doc(db, "users", cleanedCode);
-      const sharedGroupId = `group_${currentUser.uid}_${cleanedCode}`;
-      const groupDocRef = doc(db, "groups", sharedGroupId);
-
-      await runTransaction(db, async (transaction) => {
-        // Read both profiles first (all reads must be before writes!)
-        const mySnap = await transaction.get(myDocRef);
-        const partnerSnap = await transaction.get(partnerDocRef);
-
-        if (!mySnap.exists()) {
-          throw new Error("Your profile does not exist.");
-        }
-        if (!partnerSnap.exists()) {
-          throw new Error("PARTNER_NOT_FOUND");
-        }
-
-        const myData = mySnap.data();
-        const partnerData = partnerSnap.data();
-
-        // Check if I am already paired
-        if (myData.groupId || myData.partnerId) {
-          throw new Error("ALREADY_PAIRED_SELF");
-        }
-
-        // Check if partner is already paired
-        if (partnerData.groupId || partnerData.partnerId) {
-          throw new Error("ALREADY_PAIRED_PARTNER");
-        }
-
-        // Write the shared group document
-        transaction.set(groupDocRef, {
-          groupId: sharedGroupId,
-          partnerAId: currentUser.uid,
-          partnerBId: cleanedCode,
-          balances: {
-            [currentUser.uid]: 0,
-            [cleanedCode]: 0,
-          },
-          streaks: {
-            choreStreak: 0,
-            lastChoreDate: null,
-          },
-          createdAt: new Date().toISOString(),
-        });
-
-        // Update both user profiles
-        transaction.update(myDocRef, {
-          partnerId: cleanedCode,
-          groupId: sharedGroupId,
-          isSolo: false,
-        });
-
-        transaction.update(partnerDocRef, {
-          partnerId: currentUser.uid,
-          groupId: sharedGroupId,
-          isSolo: false,
-        });
-      });
+      const claimInvite = httpsCallable<{ code: string }, unknown>(functions, "claimInvite");
+      await claimInvite({ code: cleanedCode });
 
       // RootNavigator will detect the pairing and redirect automatically.
       // We do not show a blocking native Alert here, as it can deadlock
@@ -173,12 +137,14 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
     } catch (error: unknown) {
       console.error("[Pairing] Error during pairing transaction:", error);
       if (error instanceof Error) {
-        if (error.message === "PARTNER_NOT_FOUND") {
+        if (error.message.includes("INVALID_INVITE")) {
           Alert.alert(t("pairInvalidCode"), t("pairPleaseCode"));
-        } else if (error.message === "ALREADY_PAIRED_SELF") {
+        } else if (error.message.includes("Already paired")) {
           Alert.alert(t("error"), "You are already linked with a partner.");
-        } else if (error.message === "ALREADY_PAIRED_PARTNER") {
+        } else if (error.message.includes("CREATOR_ALREADY_PAIRED")) {
           Alert.alert(t("pairPartnerAlreadyPairedTitle"), t("pairPartnerAlreadyPairedMsg"));
+        } else if (error.message.includes("INVITE_USED") || error.message.includes("INVITE_EXPIRED")) {
+          Alert.alert(t("pairInvalidCode"), error.message.includes("INVITE_USED") ? "This invite has already been used." : "This invite has expired.");
         } else {
           Alert.alert(t("pairFailedTitle"), error.message);
         }
@@ -269,7 +235,7 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
             <Text style={styles.codeLabel}>{t("pairYourPersonalCode")}</Text>
             <View style={styles.codeBox}>
               <Text style={styles.codeText} numberOfLines={1} ellipsizeMode="middle">
-                {currentUser?.uid ?? t("pairLoading")}
+                {inviteLoading ? t("pairLoading") : inviteCode ?? t("pairInvalidCode")}
               </Text>
             </View>
             <View style={styles.codeActions}>
@@ -308,8 +274,8 @@ export default function PairingScreen({ navigation }: PairingScreenProps) {
               placeholder={t("pairPlaceholder")}
               placeholderTextColor="#606580"
               value={partnerCode}
-              onChangeText={setPartnerCode}
-              autoCapitalize="none"
+              onChangeText={(value) => setPartnerCode(value.toUpperCase())}
+              autoCapitalize="characters"
               autoCorrect={false}
               returnKeyType="done"
               onSubmitEditing={handleConnect}

@@ -15,34 +15,18 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
-import { useVideoPlayer, VideoView } from "expo-video";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import { doc, onSnapshot, collection, addDoc, query, where, updateDoc, deleteDoc } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { auth, db, storage } from "../../firebaseConfig";
 import { Milestone, Memory, UserProfile } from "../types";
 import { translations } from "../utils/translations";
+import { MilestoneCarousel, MemoryFeed } from "../features/memories/components";
 
 
 // Maximum upload sizes
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;  // 5 MB
-const MAX_VIDEO_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
-
-// A sub-component to handle dynamic video player hooks in lists
-function VideoMemoryPlayer({ uri }: { uri: string }) {
-  const player = useVideoPlayer(uri, (playerInstance) => {
-    playerInstance.loop = false;
-  });
-
-  return (
-    <VideoView
-      style={styles.memoryVideo}
-      player={player}
-      allowsFullscreen
-      allowsPictureInPicture
-    />
-  );
-}
+const MAX_VIDEO_SIZE_BYTES = 8 * 1024 * 1024; // Keep client and Storage rules aligned.
 
 export default function MemoryCapsuleScreen() {
   const currentUser = auth.currentUser;
@@ -295,15 +279,41 @@ export default function MemoryCapsuleScreen() {
 
 
   const handlePickMedia = async (type: "image" | "video") => {
-    if (lang === "zh") {
-      Alert.alert("即将上线 🚀", "为了节省免费云存储额度，照片/视频媒体上传功能目前已禁用，将在后续开发版本中上线。");
-    } else {
-      Alert.alert("Coming Soon 🚀", "To conserve free cloud storage quotas, photo/video media uploads are currently disabled and will be released in a future development update.");
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert(
+        lang === "zh" ? "需要媒体权限" : "Media permission required",
+        lang === "zh" ? "请允许访问照片或视频后重试。" : "Allow photo or video access, then try again."
+      );
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: type === "image" ? ["images"] : ["videos"],
+      allowsEditing: type === "image",
+      quality: 0.8,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      const asset = result.assets[0];
+      const maxBytes = type === "video" ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
+      if (asset.fileSize && asset.fileSize > maxBytes) {
+        Alert.alert(
+          t("memFileTooLarge"),
+          t("memLimitMessage")
+            .replace("{type}", type === "video" ? (lang === "zh" ? "视频" : "video") : (lang === "zh" ? "图片" : "image"))
+            .replace("{limit}", "8MB")
+            .replace("{size}", (asset.fileSize / (1024 * 1024)).toFixed(1))
+        );
+        return;
+      }
+      setMediaType(type);
+      setSelectedMedia(asset.uri);
     }
   };
 
   const handleAddMemory = async () => {
-    if (!activeMilestoneId) return;
+    if (!activeMilestoneId || !userProfile?.groupId || !currentUser) return;
     if (!newMemText.trim() && !selectedMedia) {
       Alert.alert(t("memEmptyMemory"), t("memPleaseWrite"));
       return;
@@ -311,6 +321,7 @@ export default function MemoryCapsuleScreen() {
 
     setUploading(true);
     let finalMediaUrl = "";
+    let uploadedPath: string | null = null;
 
     try {
       if (selectedMedia) {
@@ -318,7 +329,7 @@ export default function MemoryCapsuleScreen() {
         const response = await fetch(selectedMedia);
         const blob = await response.blob();
         const maxSize = mediaType === "video" ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
-        const maxLabel = mediaType === "video" ? "50MB" : "5MB";
+        const maxLabel = "8MB";
 
         if (blob.size > maxSize) {
           const typeLabel = mediaType === "video"
@@ -337,19 +348,24 @@ export default function MemoryCapsuleScreen() {
 
         const fileRef = ref(
           storage,
-          `memories/${activeMilestoneId}/${Date.now()}_${mediaType}`
+          `groups/${userProfile.groupId}/memories/${currentUser.uid}_${Date.now()}_${mediaType}`
         );
-        await uploadBytes(fileRef, blob);
+        uploadedPath = fileRef.fullPath;
+        await uploadBytes(fileRef, blob, {
+          contentType: blob.type || (mediaType === "video" ? "video/mp4" : "image/jpeg"),
+          customMetadata: { uploader: currentUser.uid },
+        });
         finalMediaUrl = await getDownloadURL(fileRef);
       }
 
       await addDoc(collection(db, "memories"), {
         milestoneId: activeMilestoneId,
-        groupId: userProfile?.groupId,
+          groupId: userProfile.groupId,
         type: selectedMedia ? mediaType : "text",
         mediaUrl: finalMediaUrl || null,
+        mediaPath: uploadedPath,
         textContent: newMemText.trim(),
-        uploadedBy: currentUser?.uid,
+          uploadedBy: currentUser.uid,
         createdAt: new Date().toISOString(),
       });
 
@@ -357,6 +373,9 @@ export default function MemoryCapsuleScreen() {
       setSelectedMedia(null);
       setMemoryModalVisible(false);
     } catch (err: unknown) {
+      if (uploadedPath) {
+        await deleteObject(ref(storage, uploadedPath)).catch(() => undefined);
+      }
       const msg = err instanceof Error ? err.message : "Upload failed";
       Alert.alert(t("memUploadFailed"), msg);
     } finally {
@@ -401,6 +420,9 @@ export default function MemoryCapsuleScreen() {
           onPress: async () => {
             try {
               await deleteDoc(doc(db, "memories", target.id));
+              if (target.mediaUrl) {
+                await deleteObject(ref(storage, target.mediaUrl)).catch(() => undefined);
+              }
               setEditMemoryModalVisible(false);
               setSelectedMemory(null);
               Alert.alert(t("memDeletedTitle"), t("memDeleteSuccess"));
@@ -446,134 +468,28 @@ export default function MemoryCapsuleScreen() {
         </View>
 
         {/* Milestones */}
-        <View style={styles.sectionHeaderRow}>
-          <Text style={[styles.sectionTitle, { color: colors.text }]}>{t("memOurMilestones")}</Text>
-          <TouchableOpacity style={styles.addBtn} onPress={() => setMilestoneModalVisible(true)}>
-            <Text style={styles.addBtnText}>{t("memAddBtn")}</Text>
-          </TouchableOpacity>
-        </View>
-
-        {milestones.length === 0 ? (
-          <View style={[styles.emptyCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={styles.emptyEmoji}>💫</Text>
-            <Text style={[styles.emptyText, { color: colors.text }]}>{t("memNoMilestonesTitle")}</Text>
-            <Text style={[styles.emptySub, { color: colors.subtitle }]}>
-              {t("memNoMilestonesSub")}
-            </Text>
-          </View>
-
-        ) : (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.milestoneScroll}
-            nestedScrollEnabled
-          >
-            {milestones.map((item) => {
-              const isActive = activeMilestoneId === item.id;
-              const { countText, labelText } = getMilestoneValues(item);
-
-              return (
-                <TouchableOpacity
-                  key={item.id}
-                  style={[
-                    styles.milestoneCard,
-                    { backgroundColor: colors.card, borderColor: colors.border },
-                    isActive && styles.activeMilestoneCard
-                  ]}
-                  onPress={() => setActiveMilestoneId(item.id)}
-                  onLongPress={() => handleEditMilestone(item)}
-                  activeOpacity={0.7}
-                >
-                  <Text style={[
-                    styles.mCardTitle,
-                    { color: colors.subtitle },
-                    isActive && styles.mCardTitleActive
-                  ]}>
-                    {item.title}
-                  </Text>
-                  <Text 
-                    numberOfLines={1} 
-                    adjustsFontSizeToFit 
-                    minimumFontScale={0.5} 
-                    style={[styles.mDaysCount, { color: colors.text }]}
-                  >
-                    {countText}
-                  </Text>
-                  {labelText ? (
-                    <Text style={[styles.mDaysLabel, { color: colors.inactiveText }]}>{labelText}</Text>
-                  ) : null}
-                </TouchableOpacity>
-              );
-            })}
-          </ScrollView>
-        )}
-        {milestones.length > 0 && (
-          <Text style={styles.longPressHint}>
-            {t("memLongPressHint")}
-          </Text>
-        )}
-
+        <MilestoneCarousel
+          colors={colors}
+          t={t}
+          milestones={milestones}
+          activeMilestoneId={activeMilestoneId}
+          valuesFor={getMilestoneValues}
+          onSelect={setActiveMilestoneId}
+          onEdit={handleEditMilestone}
+          onAdd={() => setMilestoneModalVisible(true)}
+        />
         {/* Memory Feed for active milestone */}
         {activeMilestoneId && (
-          <View style={styles.timelineSection}>
-            <View style={styles.sectionHeaderRow}>
-              <Text style={[styles.sectionTitle, { color: colors.text }]}>
-                {activeMilestone?.title ?? (lang === "zh" ? "胶囊" : "Capsule")} {t("memFeed")}
-              </Text>
-              <TouchableOpacity
-                style={styles.addBtn}
-                onPress={() => setMemoryModalVisible(true)}
-              >
-                <Text style={styles.addBtnText}>+ {lang === "zh" ? "记忆" : "Memory"}</Text>
-              </TouchableOpacity>
-            </View>
-
-            {memories.length === 0 ? (
-              <View style={[styles.emptyCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                <Text style={styles.emptyEmoji}>📸</Text>
-                <Text style={[styles.emptyText, { color: colors.text }]}>{t("memNoMemoriesTitle")}</Text>
-                <Text style={[styles.emptySub, { color: colors.subtitle }]}>{t("memNoMemoriesSub")}</Text>
-              </View>
-
-            ) : (
-              <View style={styles.timelineFeed}>
-                {memories.map((item) => (
-                  <TouchableOpacity
-                    key={item.id}
-                    style={[styles.memoryCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                    onPress={() => handleOpenEditMemory(item)}
-                    activeOpacity={0.7}
-                  >
-                    {/* Image memory */}
-                    {item.type === "image" && item.mediaUrl ? (
-                      <Image source={{ uri: item.mediaUrl }} style={styles.memoryImage} />
-                    ) : null}
-
-                    {/* Video memory — now uses the modern expo-video player */}
-                    {item.type === "video" && item.mediaUrl ? (
-                      <VideoMemoryPlayer uri={item.mediaUrl} />
-                    ) : null}
-
-                    <View style={styles.memoryBody}>
-                      {/* Only render text if non-empty */}
-                      {item.textContent ? (
-                        <Text style={[styles.memoryText, { color: colors.text }]}>"{item.textContent}"</Text>
-                      ) : null}
-                      <Text style={[styles.memoryFooter, { color: colors.inactiveText }]}>
-                        {item.uploadedBy === currentUser?.uid ? t("memByYou") : t("memByPartner")} ·{" "}
-                        {new Date(item.createdAt).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US")}
-                      </Text>
-                    </View>
-                  </TouchableOpacity>
-                ))}
-                <Text style={[styles.hintText, { color: colors.inactiveText, textAlign: "center", marginTop: 8 }]}>
-                  {t("memHintTap")}
-                </Text>
-              </View>
-
-            )}
-          </View>
+          <MemoryFeed
+            colors={colors}
+            lang={lang}
+            t={t}
+            currentUserId={currentUser?.uid ?? null}
+            title={`${activeMilestone?.title ?? (lang === "zh" ? "胶囊" : "Capsule")} ${t("memFeed")}`}
+            memories={memories}
+            onAdd={() => setMemoryModalVisible(true)}
+            onOpen={handleOpenEditMemory}
+          />
         )}
       </ScrollView>
 
@@ -701,7 +617,7 @@ export default function MemoryCapsuleScreen() {
               maxLength={500}
             />
 
-            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{lang === "zh" ? "添加媒体 (后续开发上线)" : "Attach Media (Future Development)"}</Text>
+            <Text style={[styles.modalLabel, { color: colors.subtitle }]}>{lang === "zh" ? "添加媒体" : "Attach Media"}</Text>
             <View style={styles.mediaButtonsRow}>
               <TouchableOpacity
                 style={[

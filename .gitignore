@@ -44,3 +44,12 @@ yarn-error.*
 # Cloud Functions — compiled output (source in functions/src/ is committed)
 functions/lib/
 functions/node_modules/
+
+# Tool caches, logs, and generated output
+.playwright-cli/
+output/
+coverage/
+*.log
+firebase-debug.log
+firebase-debug.*.log
+.firebase/

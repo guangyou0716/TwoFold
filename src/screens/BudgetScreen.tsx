@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   StyleSheet,
   Text,
@@ -24,11 +24,21 @@ import {
   where,
   updateDoc,
   deleteDoc,
-  writeBatch
+  writeBatch,
+  runTransaction
 } from "firebase/firestore";
 import { auth, db } from "../../firebaseConfig";
+import { scanReceiptImage } from "../services/ocr";
 import { UserProfile, GroupProfile, Transaction, SavingsGoal } from "../types";
+import {
+  BalanceHero,
+  PeriodSelector,
+  QuickPresets,
+  SavingsGoalCarousel,
+  TransactionLedger,
+} from "../features/budget/components";
 import { translations } from "../utils/translations";
+import { addMonths } from "../utils/dates";
 import * as ImagePicker from "expo-image-picker";
 
 const CATEGORIES = [
@@ -48,11 +58,9 @@ export default function BudgetScreen() {
 
   // State
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [partnerProfile, setPartnerProfile] = useState<UserProfile | null>(null);
   const [group, setGroup] = useState<GroupProfile | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
-  const processedRecurringRef = useRef(false);
 
   // Helper variables and localization hooks
   const lang = userProfile?.languagePreference ?? "en";
@@ -133,20 +141,6 @@ export default function BudgetScreen() {
     return unsub;
   }, [currentUser]);
 
-  // Load partner profile
-  useEffect(() => {
-    if (!userProfile?.partnerId) {
-      setPartnerProfile(null);
-      return;
-    }
-    const unsub = onSnapshot(doc(db, "users", userProfile.partnerId), (snap) => {
-      setPartnerProfile(snap.data() as UserProfile ?? null);
-    }, (error) => {
-      console.log("[Budget] Partner profile deleted or unauthorized:", error.message);
-    });
-    return unsub;
-  }, [userProfile?.partnerId]);
-
   // Load group and transactions
   useEffect(() => {
     if (!userProfile?.groupId || !currentUser) return;
@@ -171,63 +165,7 @@ export default function BudgetScreen() {
       where("groupId", "==", userProfile.groupId)
     );
 
-    // Process recurring transactions
-    const processRecurringTransactions = async (allTransactions: Transaction[]) => {
-      if (processedRecurringRef.current) return;
-      processedRecurringRef.current = true;
-
-      const recurring = allTransactions.filter(t => t.recurrence === "monthly" && t.nextTriggerDate && !t.isTemplate);
-      if (recurring.length === 0) return;
-
-      const todayStr = new Date().toISOString().split("T")[0];
-      const batch = writeBatch(db);
-      let hasChanges = false;
-
-      for (const rec of recurring) {
-        let nextDate = rec.nextTriggerDate!;
-        let currentChanges = false;
-
-        // If the next trigger date is today or in the past, trigger it!
-        while (nextDate <= todayStr) {
-          const newDocRef = doc(collection(db, "transactions"));
-          batch.set(newDocRef, {
-            groupId: userProfile.groupId,
-            title: `${rec.title} (Recurring)`,
-            amount: rec.amount,
-            type: rec.type,
-            category: rec.category,
-            paidBy: rec.paidBy || currentUser.uid,
-            date: nextDate,
-            createdAt: new Date().toISOString(),
-            isTemplate: false
-          });
-
-          // Advance next trigger date by 1 month
-          const d = new Date(nextDate);
-          d.setMonth(d.getMonth() + 1);
-          nextDate = d.toISOString().split("T")[0];
-          hasChanges = true;
-          currentChanges = true;
-        }
-
-        if (currentChanges) {
-          batch.update(doc(db, "transactions", rec.id), {
-            nextTriggerDate: nextDate
-          });
-        }
-      }
-
-      if (hasChanges) {
-        try {
-          await batch.commit();
-          console.log("[Recurring] Automatically processed recurring transactions!");
-        } catch (err) {
-          console.error("[Recurring] Error processing recurring transactions:", err);
-        }
-      }
-    };
-
-    const unsubTx = onSnapshot(q, async (snap) => {
+    const unsubTx = onSnapshot(q, (snap) => {
       if (isCleanedUp) return;
       const loaded: Transaction[] = snap.docs.map(
         (d) => ({ id: d.id, ...d.data() } as Transaction)
@@ -242,8 +180,6 @@ export default function BudgetScreen() {
       setPresets(templateList);
       setLoading(false);
 
-      // Process recurring transactions automatically in the background
-      await processRecurringTransactions(loaded);
     }, (err) => {
       console.error("[Budget] Load transactions error:", err);
       setLoading(false);
@@ -371,105 +307,32 @@ export default function BudgetScreen() {
 
       setScanning(true);
 
-      // Only use the dedicated Gemini key — never fall back to the Firebase key
-      const API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-      if (!API_KEY) {
-        throw new Error("EXPO_PUBLIC_GEMINI_API_KEY is not set. Please add it to your .env.local file.");
-      }
+      // OCR is performed server-side via the scanReceipt callable; the image is
+      // uploaded to a controlled temp path and the Gemini key never ships in the bundle.
+      const ocr = await scanReceiptImage(
+        currentUser!.uid,
+        asset.base64,
+        asset.mimeType ?? "image/jpeg"
+      );
 
-      const prompt = "You are an expert receipt OCR scanner. Parse this receipt image and return a JSON object with: { title: string, amount: number, category: 'Food' | 'Groceries' | 'Bills' | 'Entertainment' | 'Travel' | 'Shopping' | 'Savings' | 'Income' | 'Other', date?: string, type: 'expense' | 'income' } where category MUST be one of those exact values. If the receipt represents money received, salary, a refund, or income, type MUST be 'income'. If it represents a purchase, bill, invoice, or expense paid, type MUST be 'expense'. For the title: identify the primary transaction partner, store, or person. If there is a personal transfer recipient or sender (e.g. 'Transfer To', 'Receive From', 'Paid To', 'Transfer From', 'Payment Details', 'Merchant', 'Vendor'), use their name as the title (e.g. 'Tan Kok Siang' or 'Lee Guang You') and capitalize it properly. Do NOT use generic transaction statuses, methods, or actions like 'Transfer to Wallet', 'eWallet Balance', 'DuitNow Received', 'DuitNow', 'Transfer Success', or 'Payment Details' as the title if a specific name is present. Keep the title short (2-3 words). The date field should be in YYYY-MM-DD format (representing the transaction/receipt date). If no date is found or readable, omit it. Return ONLY the raw JSON block without markdown formatting.";
-
-      // Abort the request after 15 seconds to prevent the spinner hanging forever
-      const controller = new AbortController();
-      const fetchTimeout = setTimeout(() => controller.abort(), 15000);
-
-      let response: Response;
-      try {
-        response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            signal: controller.signal,
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    { text: prompt },
-                    {
-                      inlineData: {
-                        mimeType: "image/jpeg",
-                        data: asset.base64
-                      }
-                    }
-                  ]
-                }
-              ]
-            })
-          }
-        );
-      } finally {
-        clearTimeout(fetchTimeout);
+      setTxTitle(ocr.title);
+      setTxAmount(ocr.amount);
+      const matchedCat = CATEGORIES.find(
+        (c) => c.value.toLowerCase() === ocr.category.toLowerCase()
+      );
+      setTxCategory(matchedCat ? matchedCat.value : "Other");
+      const dp = ocr.date.split("-");
+      if (dp.length === 3) {
+        const newD = new Date(parseInt(dp[0], 10), parseInt(dp[1], 10) - 1, parseInt(dp[2], 10));
+        if (!isNaN(newD.getTime())) setTxDate(newD);
       }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("Gemini API error status:", response.status, errorText);
-        throw new Error(`Gemini API returned status ${response.status}`);
-      }
-
-      const data = await response.json();
-      if (!data.candidates || data.candidates.length === 0 || !data.candidates[0].content || !data.candidates[0].content.parts || data.candidates[0].content.parts.length === 0) {
-        throw new Error("Invalid or empty response structure from Gemini API");
-      }
-
-      const textResponse = data.candidates[0].content.parts[0].text;
-      let cleanText = textResponse.trim();
-      
-      // Remove potential markdown wrappers
-      if (cleanText.startsWith("```json")) {
-        cleanText = cleanText.substring(7);
-      } else if (cleanText.startsWith("```")) {
-        cleanText = cleanText.substring(3);
-      }
-      if (cleanText.endsWith("```")) {
-        cleanText = cleanText.substring(0, cleanText.length - 3);
-      }
-      cleanText = cleanText.trim();
-
-      const parsed = JSON.parse(cleanText);
-
-      // Apply the fields to the form
-      if (parsed.title) setTxTitle(parsed.title);
-      if (parsed.amount !== undefined) setTxAmount(parsed.amount.toString());
-      if (parsed.category) {
-        const matchedCat = CATEGORIES.find(
-          (c) => c.value.toLowerCase() === parsed.category!.toLowerCase()
-        );
-        setTxCategory(matchedCat ? matchedCat.value : "Other");
-      }
-      if (parsed.date) {
-        const parts = parsed.date.split("-");
-        if (parts.length === 3) {
-          const year = parseInt(parts[0], 10);
-          const month = parseInt(parts[1], 10) - 1; // 0-indexed
-          const day = parseInt(parts[2], 10);
-          const newD = new Date(year, month, day);
-          if (!isNaN(newD.getTime())) {
-            setTxDate(newD);
-          }
-        }
-      }
-      if (parsed.type === "expense" || parsed.type === "income") {
-        setTxType(parsed.type);
-      } else {
-        setTxType("expense");
-      }
+      setTxType(ocr.type === "income" ? "income" : "expense");
 
       setScanning(false);
-      Alert.alert(t("success") + " 🎉", t("budgetScanSuccess"));
+      Alert.alert(
+        t("success") + " 🎉",
+        ocr.needsConfirmation ? t("budgetScanConfirm") : t("budgetScanSuccess")
+      );
     } catch (err: any) {
       // Log full error details to console only — never expose to the user
       console.error("[OCR] Scan receipt error:", err);
@@ -531,37 +394,80 @@ export default function BudgetScreen() {
       };
 
       if (editingTransaction) {
-        await updateDoc(doc(db, "transactions", editingTransaction.id), {
+        const batch = writeBatch(db);
+        const transactionRef = doc(db, "transactions", editingTransaction.id);
+        const recurrenceRef = editingTransaction.recurrenceId
+          ? doc(db, "recurrences", editingTransaction.recurrenceId)
+          : txRecurrence === "monthly"
+            ? doc(collection(db, "recurrences"))
+            : null;
+
+        batch.update(transactionRef, {
           ...txData,
           recurrence: txRecurrence,
-          nextTriggerDate: txRecurrence === "monthly" ? txData.date : null
+          recurrenceId: recurrenceRef?.id ?? null,
+          nextTriggerDate: null,
         });
+
+        if (recurrenceRef && txRecurrence === "monthly") {
+          batch.set(recurrenceRef, {
+            groupId: userProfile.groupId,
+            kind: "monthly",
+            anchorDate: addMonths(txData.date, 1),
+            paused: false,
+            template: {
+              ...txData,
+              groupId: userProfile.groupId,
+              paidBy: currentUser.uid,
+              isTemplate: false,
+            },
+            createdAt: editingTransaction.createdAt,
+          }, { merge: true });
+        } else if (editingTransaction.recurrenceId) {
+          batch.delete(recurrenceRef!);
+        }
+
+        await batch.commit();
         Alert.alert(t("success") + " 🎉", t("budgetTxUpdated"));
       } else {
-        // 1. Save normal transaction log
-        await addDoc(collection(db, "transactions"), {
+        const createdAt = new Date().toISOString();
+        const batch = writeBatch(db);
+        const transactionRef = doc(collection(db, "transactions"));
+        const template = {
           ...txData,
           groupId: userProfile.groupId,
           paidBy: currentUser.uid,
-          createdAt: new Date().toISOString(),
-          recurrence: txRecurrence,
-          nextTriggerDate: txRecurrence === "monthly" ? txData.date : null,
-          isTemplate: false
-        });
+          isTemplate: false,
+        };
 
-        // 2. Save as Hotkey Template if selected
-        if (saveAsTemplate) {
-          await addDoc(collection(db, "transactions"), {
-            title: txTitle.trim(),
-            amount: amountFloat,
-            type: txType,
-            category: txType === "income" ? "Income" : txCategory,
+        if (txRecurrence === "monthly") {
+          const recurrenceRef = doc(collection(db, "recurrences"));
+          batch.set(transactionRef, {
+            ...template,
+            recurrence: "monthly",
+            recurrenceId: recurrenceRef.id,
+            createdAt,
+          });
+          batch.set(recurrenceRef, {
             groupId: userProfile.groupId,
-            paidBy: currentUser.uid,
-            createdAt: new Date().toISOString(),
-            isTemplate: true
+            kind: "monthly",
+            anchorDate: addMonths(txData.date, 1),
+            paused: false,
+            template,
+            createdAt,
+          });
+        } else {
+          batch.set(transactionRef, { ...template, recurrence: "none", createdAt });
+        }
+
+        if (saveAsTemplate) {
+          batch.set(doc(collection(db, "transactions")), {
+            ...template,
+            createdAt,
+            isTemplate: true,
           });
         }
+        await batch.commit();
 
         Alert.alert(t("success") + " 🎉", t("budgetTxLogged"));
       }
@@ -585,7 +491,12 @@ export default function BudgetScreen() {
           style: "destructive",
           onPress: async () => {
             try {
-              await deleteDoc(doc(db, "transactions", tx.id));
+              const batch = writeBatch(db);
+              batch.delete(doc(db, "transactions", tx.id));
+              if (tx.recurrenceId) {
+                batch.delete(doc(db, "recurrences", tx.recurrenceId));
+              }
+              await batch.commit();
               handleCloseTransModal();
               Alert.alert(t("budgetTxDeleted"), "");
             } catch (err: unknown) {
@@ -793,21 +704,10 @@ export default function BudgetScreen() {
     }
 
     try {
-      const batch = writeBatch(db);
       const goalRef = doc(db, "savings_goals", selectedGoalForFunds.id);
-      
-      const newCurrentAmount = fundsAction === "add" 
-        ? selectedGoalForFunds.currentAmount + amountFloat
-        : Math.max(0, selectedGoalForFunds.currentAmount - amountFloat);
-
-      // 1. Update savings goal amount
-      batch.update(goalRef, {
-        currentAmount: newCurrentAmount
-      });
-
-      // 2. Log transaction in ledger to adjust balance automatically!
       const txRef = doc(collection(db, "transactions"));
-      batch.set(txRef, {
+
+      const ledgerEntry = {
         groupId: userProfile.groupId,
         title: fundsAction === "add"
           ? `${lang === "zh" ? "存入储蓄：" : "Savings deposit: "}${selectedGoalForFunds.title}`
@@ -818,22 +718,33 @@ export default function BudgetScreen() {
         paidBy: currentUser.uid,
         date: new Date().toISOString().split("T")[0],
         createdAt: new Date().toISOString(),
-        isTemplate: false
-      });
+        isTemplate: false,
+      };
 
-      await batch.commit();
+      // Atomic read-modify-write: re-read the goal inside a transaction so two
+      // partners funding the same goal concurrently cannot overwrite each
+      // other's deposit. The 0-floor on withdrawals applies to the fresh value.
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(goalRef);
+        const current = Number((snap.data() as SavingsGoal | undefined)?.currentAmount ?? 0);
+        const nextAmount =
+          fundsAction === "add" ? current + amountFloat : Math.max(0, current - amountFloat);
+
+        transaction.update(goalRef, { currentAmount: nextAmount });
+        transaction.set(txRef, ledgerEntry);
+      });
 
       const alertTitle = lang === "zh" ? "交易成功！ 🚀" : "Transaction Successful! 🚀";
       const alertMsg = fundsAction === "add"
-        ? (lang === "zh" 
-            ? `已成功将 ${activeCurrency}${amountFloat.toFixed(2)} 存入 "${selectedGoalForFunds.title}"，并在账单中记为一笔储蓄支出！` 
+        ? (lang === "zh"
+            ? `已成功将 ${activeCurrency}${amountFloat.toFixed(2)} 存入 "${selectedGoalForFunds.title}"，并在账单中记为一笔储蓄支出！`
             : `Successfully deposited ${activeCurrency}${amountFloat.toFixed(2)} into "${selectedGoalForFunds.title}", and logged it as a savings expense!`)
-        : (lang === "zh" 
-            ? `已成功从 "${selectedGoalForFunds.title}" 提取 ${activeCurrency}${amountFloat.toFixed(2)}，并在账单中记为一笔储蓄收入！` 
+        : (lang === "zh"
+            ? `已成功从 "${selectedGoalForFunds.title}" 提取 ${activeCurrency}${amountFloat.toFixed(2)}，并在账单中记为一笔储蓄收入！`
             : `Successfully withdrew ${activeCurrency}${amountFloat.toFixed(2)} from "${selectedGoalForFunds.title}", and logged it as a savings income!`);
-      
+
       Alert.alert(alertTitle, alertMsg);
-      
+
       setFundsModalVisible(false);
       setSelectedGoalForFunds(null);
       setFundsAmount("");
@@ -902,238 +813,56 @@ export default function BudgetScreen() {
           </View>
         </View>
 
-        {/* Balance Card */}
-        <View style={[styles.balanceCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.balanceLabel, { color: colors.subtitle }]}>{t("budgetRemainingPool")} ({filterLabel})</Text>
-          <Text style={[styles.balanceValue, remainingBalance < 0 && { color: "#FF3B30" }]}>
-            {activeCurrency}{remainingBalance.toFixed(2)}
-          </Text>
-          <View style={[styles.allowanceRow, { borderTopColor: colors.border }]}>
-            <Text style={[styles.allowanceText, { color: colors.subtitle }]}>{t("budgetStartingAllowance")}{activeCurrency}{startingAllowance.toFixed(2)}</Text>
-            <TouchableOpacity
-              style={[styles.editAllowanceBtn, { backgroundColor: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.02)", borderColor: colors.border }]}
-              onPress={() => {
-                setNewAllowance(startingAllowance.toString());
-                setAllowanceModalVisible(true);
-              }}
-            >
-              <Text style={[styles.editAllowanceBtnText, { color: colors.subtitle }]}>{t("budgetEditBtn")}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Stats Column */}
-        <View style={styles.statsRow}>
-          <View style={[styles.statBox, { borderLeftColor: "#34C759", backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={[styles.statLabel, { color: colors.subtitle }]}>{t("budgetIncomes")} ({filterLabel})</Text>
-            <Text style={styles.statValueIncome}>+{activeCurrency}{totalIncomes.toFixed(2)}</Text>
-          </View>
-          <View style={[styles.statBox, { borderLeftColor: "#FF5E7E", backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={[styles.statLabel, { color: colors.subtitle }]}>{t("budgetExpenses")} ({filterLabel})</Text>
-            <Text style={styles.statValueExpense}>-{activeCurrency}{totalExpenses.toFixed(2)}</Text>
-          </View>
-        </View>
-
+        {/* Balance Hero + Stats */}
+        <BalanceHero
+          colors={colors}
+          isDark={isDark}
+          t={t}
+          filterLabel={filterLabel}
+          activeCurrency={activeCurrency}
+          remainingBalance={remainingBalance}
+          startingAllowance={startingAllowance}
+          totalIncomes={totalIncomes}
+          totalExpenses={totalExpenses}
+          onEditAllowance={() => {
+            setNewAllowance(startingAllowance.toString());
+            setAllowanceModalVisible(true);
+          }}
+        />
         {/* Quick Presets / Hotkeys */}
-        {presets.length > 0 && (
-          <View style={styles.presetsContainer}>
-            <Text style={[styles.presetsTitle, { color: colors.text }]}>
-              {lang === "zh" ? "⚡ 快捷记账 (点击直接记录为今日)" : "⚡ Quick Presets (Tap to log for today)"}
-            </Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.presetsScroll}>
-              {presets.map((preset) => (
-                <TouchableOpacity
-                  key={preset.id}
-                  style={[styles.presetCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                  onPress={() => handleTriggerPreset(preset)}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.presetContent}>
-                    <Text style={styles.presetEmoji}>
-                      {getCategoryEmoji(preset.category, preset.type)}
-                    </Text>
-                    <View style={styles.presetInfo}>
-                      <Text style={[styles.presetName, { color: colors.text }]} numberOfLines={1}>
-                        {preset.title}
-                      </Text>
-                      <Text style={preset.type === "income" ? styles.presetAmountIncome : styles.presetAmountExpense} numberOfLines={1}>
-                        {preset.type === "income" ? "+" : "-"}{activeCurrency}{preset.amount.toFixed(2)}
-                      </Text>
-                    </View>
-                    <TouchableOpacity
-                      style={styles.deletePresetBtn}
-                      onPress={() => handleDeletePreset(preset)}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={styles.deletePresetBtnText}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </View>
-        )}
-
+        <QuickPresets
+          colors={colors}
+          lang={lang}
+          activeCurrency={activeCurrency}
+          presets={presets}
+          categoryEmojiFor={getCategoryEmoji}
+          onTrigger={handleTriggerPreset}
+          onDelete={handleDeletePreset}
+        />
         {/* Savings Goals Section */}
-        <View style={styles.savingsSection}>
-          <View style={styles.savingsHeader}>
-            <Text style={[styles.presetsTitle, { color: colors.text, marginBottom: 0 }]}>
-              {lang === "zh" ? "🐷 储蓄目标 (Savings Goals)" : "🐷 Savings Goals"}
-            </Text>
-            <TouchableOpacity onPress={() => handleOpenAddGoalModal()}>
-              <Text style={{ color: "#FF5E7E", fontSize: 13, fontWeight: "700" }}>
-                {lang === "zh" ? "+ 新建目标" : "+ New Goal"}
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.presetsScroll}>
-            {/* Savings Goal Cards */}
-            {savingsGoals.map((goal) => {
-              const progressPercent = Math.min(100, Math.round((goal.currentAmount / goal.targetAmount) * 100));
-              const daysLeft = goal.targetDate ? Math.max(0, Math.ceil((new Date(goal.targetDate).getTime() - new Date().setHours(0,0,0,0)) / (1000 * 60 * 60 * 24))) : null;
-
-              return (
-                <TouchableOpacity
-                  key={goal.id}
-                  style={[styles.goalCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                  onPress={() => handleOpenAddGoalModal(goal)}
-                  activeOpacity={0.8}
-                >
-                  <View style={styles.goalCardTop}>
-                    <Text style={styles.goalEmoji}>🐷</Text>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.goalTitle, { color: colors.text }]} numberOfLines={1}>
-                        {goal.title}
-                      </Text>
-                      <Text style={[styles.goalTargetText, { color: colors.subtitle }]}>
-                        {lang === "zh" ? "目标金额：" : "Target: "}{activeCurrency}{goal.targetAmount.toFixed(0)}
-                      </Text>
-                    </View>
-                  </View>
-
-                  <View style={styles.goalProgressRow}>
-                    <Text style={[styles.goalSavedText, { color: colors.text }]}>
-                      {activeCurrency}{goal.currentAmount.toFixed(0)} ({progressPercent}%)
-                    </Text>
-                  </View>
-
-                  {/* Progress Bar */}
-                  <View style={styles.goalProgressBarBg}>
-                    <View style={[styles.goalProgressBarFill, { width: `${progressPercent}%`, backgroundColor: progressPercent >= 100 ? "#34C759" : "#FF5E7E" }]} />
-                  </View>
-
-                  {/* Target Date Details */}
-                  {goal.targetDate ? (
-                    <Text style={styles.goalDateText}>
-                      📅 {new Date(goal.targetDate).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US")} ({daysLeft !== null && daysLeft > 0 ? (lang === "zh" ? `还剩 ${daysLeft} 天` : `${daysLeft} days left`) : (lang === "zh" ? "已到期" : "Due")})
-                    </Text>
-                  ) : (
-                    <Text style={styles.goalDateText}>📅 {lang === "zh" ? "无截止日期" : "No deadline"}</Text>
-                  )}
-
-                  {/* Quick Fund Buttons */}
-                  <View style={styles.goalActionButtons}>
-                    <TouchableOpacity
-                      style={[styles.goalFundBtn, { backgroundColor: "#FF5E7E" }]}
-                      onPress={() => {
-                        setSelectedGoalForFunds(goal);
-                        setFundsAction("add");
-                        setFundsAmount("");
-                        setFundsModalVisible(true);
-                      }}
-                    >
-                      <Text style={styles.goalFundBtnText}>{lang === "zh" ? "存钱" : "Save"}</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.goalFundBtn, { backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 1, borderColor: colors.border }]}
-                      onPress={() => {
-                        setSelectedGoalForFunds(goal);
-                        setFundsAction("deduct");
-                        setFundsAmount("");
-                        setFundsModalVisible(true);
-                      }}
-                    >
-                      <Text style={[styles.goalFundBtnText, { color: colors.text }]}>{lang === "zh" ? "取钱" : "Withdraw"}</Text>
-                    </TouchableOpacity>
-                  </View>
-                </TouchableOpacity>
-              );
-            })}
-
-            {/* Dotted Card for Creating Savings Goal */}
-            <TouchableOpacity
-              style={[styles.goalCard, { borderStyle: "dashed", borderColor: colors.border, alignItems: "center", justifyContent: "center" }]}
-              onPress={() => handleOpenAddGoalModal()}
-              activeOpacity={0.7}
-            >
-              <Text style={{ fontSize: 32, marginBottom: 8 }}>🐷</Text>
-              <Text style={{ fontSize: 14, fontWeight: "700", color: "#FF5E7E" }}>
-                {lang === "zh" ? "+ 新建储蓄目标" : "+ New Savings Goal"}
-              </Text>
-              <Text style={{ fontSize: 11, color: colors.subtitle, textAlign: "center", marginTop: 4, paddingHorizontal: 12 }}>
-                {lang === "zh" ? "自动平衡日常记账" : "Balance daily budgets"}
-              </Text>
-            </TouchableOpacity>
-          </ScrollView>
-        </View>
-
-        {/* Ledger Headers */}
-        <View style={styles.ledgerHeaderRow}>
-          <Text style={[styles.sectionTitle, { color: colors.text }]}>{t("budgetTransactionLog")}</Text>
-          <TouchableOpacity style={styles.addTransBtn} onPress={() => setTransModalVisible(true)}>
-            <Text style={styles.addTransText}>{t("budgetAddBillBtn")}</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Filter Tab Selector */}
-        <View style={[styles.filterTabContainer, { backgroundColor: colors.tabBackground, borderColor: colors.border }]}>
-          <TouchableOpacity
-            style={[styles.filterTabButton, budgetFilter === "all" && styles.filterTabButtonActive]}
-            onPress={() => setBudgetFilter("all")}
-          >
-            <Text style={[styles.filterTabButtonText, budgetFilter === "all" && styles.filterTabButtonTextActive, { color: budgetFilter === "all" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("budgetTabAll")}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.filterTabButton, budgetFilter === "daily" && styles.filterTabButtonActive]}
-            onPress={() => setBudgetFilter("daily")}
-          >
-            <Text style={[styles.filterTabButtonText, budgetFilter === "daily" && styles.filterTabButtonTextActive, { color: budgetFilter === "daily" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("budgetTabToday")}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.filterTabButton, budgetFilter === "monthly" && styles.filterTabButtonActive]}
-            onPress={() => setBudgetFilter("monthly")}
-          >
-            <Text style={[styles.filterTabButtonText, budgetFilter === "monthly" && styles.filterTabButtonTextActive, { color: budgetFilter === "monthly" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("budgetTabMonth")}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.filterTabButton, budgetFilter === "yearly" && styles.filterTabButtonActive]}
-            onPress={() => setBudgetFilter("yearly")}
-          >
-            <Text style={[styles.filterTabButtonText, budgetFilter === "yearly" && styles.filterTabButtonTextActive, { color: budgetFilter === "yearly" ? "#FFFFFF" : colors.inactiveText }]}>
-              {t("budgetTabYear")}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        {budgetFilter !== "all" && (
-          <TouchableOpacity
-            style={[styles.customFilterTrigger, { backgroundColor: colors.inputBg, borderColor: colors.border }]}
-            onPress={() => setShowFilterDatePicker(true)}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.customFilterTriggerText, { color: colors.text }]}>
-              {t("budgetReferencePeriod")}<Text style={{ color: "#FF5E7E", fontWeight: "700" }}>{filterLabel}</Text> ✏️
-            </Text>
-          </TouchableOpacity>
-        )}
-
+        <SavingsGoalCarousel
+          colors={colors}
+          lang={lang}
+          activeCurrency={activeCurrency}
+          goals={savingsGoals}
+          onOpenGoal={handleOpenAddGoalModal}
+          onFund={(goal, action) => {
+            setSelectedGoalForFunds(goal);
+            setFundsAction(action);
+            setFundsAmount("");
+            setFundsModalVisible(true);
+          }}
+        />
+        {/* Ledger Header + Period Selector */}
+        <PeriodSelector
+          colors={colors}
+          t={t}
+          budgetFilter={budgetFilter}
+          filterLabel={filterLabel}
+          onFilterChange={setBudgetFilter}
+          onAddTransaction={() => setTransModalVisible(true)}
+          onOpenDatePicker={() => setShowFilterDatePicker(true)}
+        />
         {showFilterDatePicker && Platform.OS === "ios" ? (
           <Modal visible={showFilterDatePicker} transparent animationType="slide">
             <View style={styles.modalOverlay}>
@@ -1175,49 +904,18 @@ export default function BudgetScreen() {
         ) : null}
 
         {/* Ledger Log */}
-        {filteredTransactions.length === 0 ? (
-          <View style={[styles.emptyBox, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <Text style={styles.emptyEmoji}>💳</Text>
-            <Text style={[styles.emptyText, { color: colors.text }]}>{t("budgetNoTransactionsTitle")}</Text>
-            <Text style={[styles.emptySubText, { color: colors.subtitle }]}>{t("budgetNoTransactionsSub")}</Text>
-          </View>
-        ) : (
-          <View style={styles.transactionsList}>
-            {filteredTransactions.map((item) => (
-              <TouchableOpacity
-                key={item.id}
-                style={[styles.txCard, { backgroundColor: colors.card, borderColor: colors.border }]}
-                onPress={() => handleEditTransaction(item)}
-                onLongPress={() => handleDeleteTransaction(item)}
-                activeOpacity={0.7}
-              >
-                <View style={[styles.txIconBox, { backgroundColor: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)" }]}>
-                  <Text style={styles.txIcon}>
-                    {item.type === "income"
-                      ? "💰"
-                      : getCategoryLabel(item.category).split(" ")[1] ?? "❓"}
-                  </Text>
-                </View>
-                <View style={styles.txMain}>
-                  <Text style={[styles.txTitle, { color: colors.text }]}>{item.title}</Text>
-                  <Text style={[styles.txMeta, { color: colors.subtitle }]}>
-                    {getCategoryLabel(item.category)} · {item.paidBy === currentUser?.uid ? (lang === "zh" ? "你" : "You") : (lang === "zh" ? "伴侣" : "Partner")} · {new Date(item.date).toLocaleDateString(lang === "zh" ? "zh-CN" : "en-US")}
-                  </Text>
-                </View>
-                <Text
-                  style={[
-                    styles.txAmount,
-                    item.type === "income" ? styles.txIncomeText : { color: colors.text }
-                  ]}
-                >
-                  {item.type === "income" ? "+" : "-"}{activeCurrency}{item.amount.toFixed(2)}
-                </Text>
-              </TouchableOpacity>
-            ))}
-            <Text style={[styles.longPressHint, { color: colors.inactiveText }]}>{t("budgetHint")}</Text>
-          </View>
-        )}
-
+        <TransactionLedger
+          colors={colors}
+          isDark={isDark}
+          lang={lang}
+          t={t}
+          activeCurrency={activeCurrency}
+          currentUserId={currentUser?.uid ?? null}
+          transactions={filteredTransactions}
+          categoryLabelFor={getCategoryLabel}
+          onEdit={handleEditTransaction}
+          onDelete={handleDeleteTransaction}
+        />
       </ScrollView>
 
       {/* Add Transaction Modal */}

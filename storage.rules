@@ -1,0 +1,75 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // The requesting user's own profile document.
+    function myProfile() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Whether the requesting user is a member of `groupId`.
+    function isMemberOfGroup(groupId) {
+      return isSignedIn() && myProfile().groupId == groupId;
+    }
+
+    // Bounded media (image/video under 8 MiB).
+    function isMedia(ct, size) {
+      return ct.matches('image/.*') || ct.matches('video/.*');
+    }
+
+    // -------------------------------------------------------------------------
+    // Group-scoped media:   groups/{groupId}/memories/{asset}
+    //   Read/download: group members only.
+    //   Upload: a group member uploading to their own group's area, bounded
+    //     content, tag with uploader metadata for ownership-based delete.
+    //   Delete: any group member can remove a shared memory asset.
+    // -------------------------------------------------------------------------
+    match /groups/{groupId}/memories/{asset} {
+      allow read: if isMemberOfGroup(groupId);
+
+      allow create, update: if isMemberOfGroup(groupId)
+        && request.resource.name.startsWith('groups/' + groupId + '/')
+        && isMedia(request.resource.contentType, request.resource.size)
+        && request.resource.size <= 8 * 1024 * 1024
+        && request.resource.metadata.uploader == request.auth.uid;
+
+      allow delete: if isMemberOfGroup(groupId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Temporary upload area for receipt OCR: users/{uid}/pending/{file}
+    //   Owner uploads bounded images; the OCR backend reads + deletes (via IAM).
+    // -------------------------------------------------------------------------
+    match /users/{uid}/pending/{file} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow create, update: if isSignedIn() && request.auth.uid == uid
+        && isMedia(request.resource.contentType, request.resource.size)
+        && request.resource.size <= 8 * 1024 * 1024;
+      allow delete: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // Export bundles produced by the backend: users/{uid}/exports/{file}
+    //   Backend writes/reads via IAM (Object Admin role); the owner can only
+    //   read/retrieve their own signed bundle.
+    // -------------------------------------------------------------------------
+    match /users/{uid}/exports/{file} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      // No user write; backend service account writes via IAM.
+    }
+
+    // -------------------------------------------------------------------------
+    // Deny everything else.
+    // -------------------------------------------------------------------------
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
