@@ -6,7 +6,7 @@
  *
  * Run standalone:
  *   cd tests/rules && firebase emulators:exec --project demo-twofold \
- *     --only firestore,storage "node --test ./"
+ *     --only firestore,storage "node --test --test-concurrency=1 *.test.js"
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -52,23 +52,31 @@ async function seed(seedFn) {
 // ---------------------------------------------------------------------------
 const GROUP = "group_alice_bob";
 
-async function seedGroup(name, groupId, members) {
+async function seedGroup(groupId, name, members) {
   await seed(async (ctx) => {
     const fsDb = ctx.firestore();
+    const pair = Array.isArray(name) ? name : [];
     for (const [uid, isPaired] of Object.entries(members)) {
+      const inPair = pair.includes(uid);
       await setDoc(doc(fsDb, "users", uid), {
         uid,
         displayName: uid,
-        partnerId: isPaired ? (Object.keys(members).find((k) => k !== uid && members[k]) ?? null) : "",
-        groupId: isPaired ? groupId : isPaired === false ? "solo_" + uid : null,
+        partnerId: isPaired
+          ? (inPair ? (pair.find((k) => k !== uid) ?? null) : null)
+          : "",
+        groupId: isPaired
+          ? (inPair ? groupId : "group_" + uid)
+          : isPaired === false
+            ? "solo_" + uid
+            : null,
         isSolo: !isPaired,
         createdAt: new Date().toISOString(),
       });
-      if (isPaired) {
+      if (isPaired && inPair) {
         await setDoc(doc(fsDb, "groups", groupId), {
           groupId,
-          partnerAId: name[0],
-          partnerBId: name[1],
+          partnerAId: pair[0],
+          partnerBId: pair[1],
           createdAt: new Date().toISOString(),
         });
       }
@@ -78,13 +86,13 @@ async function seedGroup(name, groupId, members) {
 
 test("stranger cannot read a paired user's full profile", async () => {
   await seedGroup(GROUP, ["alice", "bob"], { alice: true, bob: true, mallory: false });
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   await assertFails(getDoc(doc(mallory.firestore(), "users", "alice")));
 });
 
 test("partner can read their partner's profile", async () => {
   await seedGroup(GROUP, ["alice", "bob"], { alice: true, bob: true, mallory: false });
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   await assertSucceeds(getDoc(doc(bob.firestore(), "users", "alice")));
 });
 
@@ -101,7 +109,7 @@ test("stranger cannot read an unpaired user's profile", async () => {
       createdAt: new Date().toISOString(),
     });
   });
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   await assertFails(getDoc(doc(mallory.firestore(), "users", "dave")));
 });
 
@@ -113,7 +121,7 @@ test("client may create its own solo group", async () => {
       createdAt: new Date().toISOString(),
     });
   });
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertSucceeds(
     setDoc(doc(alice.firestore(), "groups", "solo_alice"), {
       groupId: "solo_alice",
@@ -134,7 +142,7 @@ test("client cannot create a pair group (pairing is callable-only)", async () =>
       createdAt: new Date().toISOString(),
     });
   });
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertFails(
     setDoc(doc(alice.firestore(), "groups", "group_alice_dave"), {
       groupId: "group_alice_dave",
@@ -147,7 +155,7 @@ test("client cannot create a pair group (pairing is callable-only)", async () =>
 
 test("owner can write their own profile", async () => {
   await seedGroup(GROUP, ["alice", "bob"], { alice: true, bob: true, mallory: false });
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertSucceeds(updateDoc(doc(alice.firestore(), "users", "alice"), {
     displayName: "Alicia",
     timezoneLocation: "Asia/Kuala_Lumpur",
@@ -156,7 +164,7 @@ test("owner can write their own profile", async () => {
 
 test("user cannot reassign their own group to a stranger's group", async () => {
   await seedGroup(GROUP, ["alice", "bob"], { alice: true, bob: true, mallory: false, eve: true });
-  const eve = env.authenticatedContext("eve", { uid: "eve" });
+  const eve = env.authenticatedContext("eve");
   // eve tries to join alice's group by editing her own profile
   await assertFails(updateDoc(doc(eve.firestore(), "users", "eve"), {
     groupId: "group_alice_bob",
@@ -177,17 +185,17 @@ test("outsider cannot read group shared memory", async () => {
     await setDoc(doc(fsDb, "groups", GROUP), { groupId: GROUP, partnerAId: "alice", partnerBId: "bob", createdAt: new Date().toISOString() });
     await setDoc(doc(fsDb, "memories", "m1"), { groupId: GROUP, uploadedBy: "alice", textContent: "secret", createdAt: new Date().toISOString() });
   });
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   await assertFails(getDoc(doc(mallory.firestore(), "memories", "m1")));
 });
 
 test("partner can read shared memory", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   await assertSucceeds(getDoc(doc(bob.firestore(), "memories", "m1")));
 });
 
 test("memory creator must be the authenticated uploader", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   await assertFails(
     addDoc(collection(bob.firestore(), "memories"), {
       groupId: GROUP,
@@ -199,7 +207,7 @@ test("memory creator must be the authenticated uploader", async () => {
 });
 
 test("client cannot forge a generator-created transaction (source recurrence)", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   // Directly writing a recurrence-instance is reserved for the backend.
   await assertFails(
     addDoc(collection(bob.firestore(), "transactions"), {
@@ -216,7 +224,7 @@ test("client cannot forge a generator-created transaction (source recurrence)", 
 });
 
 test("manual client transaction write is allowed", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   await assertSucceeds(
     addDoc(collection(bob.firestore(), "transactions"), {
       groupId: GROUP,
@@ -231,7 +239,7 @@ test("manual client transaction write is allowed", async () => {
 });
 
 test("outsider cannot create a transaction in the group", async () => {
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   await assertFails(
     addDoc(collection(mallory.firestore(), "transactions"), {
       groupId: GROUP,
@@ -246,7 +254,7 @@ test("outsider cannot create a transaction in the group", async () => {
 });
 
 test("nudge can only be sent to your partner", async () => {
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   // alice trying to nudge mallory (not partner) → denied
   await assertFails(
     addDoc(collection(alice.firestore(), "nudges"), {
@@ -259,14 +267,14 @@ test("nudge can only be sent to your partner", async () => {
 });
 
 test("group ownership id cannot be mutated after creation", async () => {
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertFails(updateDoc(doc(alice.firestore(), "groups", GROUP), {
     partnerAId: "mallory",
   }));
 });
 
 test("savings goal update stays within the group", async () => {
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertSucceeds(
     setDoc(doc(alice.firestore(), "savings_goals", "g1"), {
       groupId: GROUP,
@@ -284,9 +292,10 @@ test("savings goal update stays within the group", async () => {
 // ---------------------------------------------------------------------------
 
 test("group member can create and edit a recurrence rule", async () => {
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
+  const db = alice.firestore();
   await assertSucceeds(
-    setDoc(doc(alice.firestore(), "recurrences", "rent-rule"), {
+    setDoc(doc(db, "recurrences", "rent-rule"), {
       groupId: GROUP,
       kind: "monthly",
       anchorDate: "2026-10-01",
@@ -296,12 +305,12 @@ test("group member can create and edit a recurrence rule", async () => {
     })
   );
   await assertSucceeds(
-    updateDoc(doc(alice.firestore(), "recurrences", "rent-rule"), { paused: true })
+    updateDoc(doc(db, "recurrences", "rent-rule"), { paused: true })
   );
 });
 
 test("outsider cannot create a recurrence rule in the group", async () => {
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   await assertFails(
     setDoc(doc(mallory.firestore(), "recurrences", "evil-rule"), {
       groupId: GROUP,
@@ -315,7 +324,7 @@ test("outsider cannot create a recurrence rule in the group", async () => {
 });
 
 test("recurrence group cannot be reassigned by a member", async () => {
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   await assertFails(
     updateDoc(doc(alice.firestore(), "recurrences", "rent-rule"), {
       groupId: "group_someone_else",
@@ -324,7 +333,7 @@ test("recurrence group cannot be reassigned by a member", async () => {
 });
 
 test("client cannot write a transaction carrying a server occurrenceId", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   await assertFails(
     addDoc(collection(bob.firestore(), "transactions"), {
       groupId: GROUP,

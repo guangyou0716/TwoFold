@@ -58,7 +58,7 @@
     "typecheck": "tsc --noEmit",
     "test": "jest",
     "build": "expo export --platform web",
-    "test:rules": "node tests/rules/node_modules/firebase-tools/lib/bin/firebase.js emulators:exec --project demo-twofold --only firestore,storage \"node --test tests/rules\"",
+    "test:rules": "node tests/rules/node_modules/firebase-tools/lib/bin/firebase.js emulators:exec --project demo-twofold --only firestore,storage \"node --test --test-concurrency=1 tests/rules/*.test.js\"",
     "doctor": "npx expo-doctor"
   },
   "private": true
