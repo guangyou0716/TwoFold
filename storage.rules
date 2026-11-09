@@ -35,7 +35,6 @@ service firebase.storage {
       allow read: if isMemberOfGroup(groupId);
 
       allow create, update: if isMemberOfGroup(groupId)
-        && request.resource.name.startsWith('groups/' + groupId + '/')
         && isMedia(request.resource.contentType, request.resource.size)
         && request.resource.size <= 8 * 1024 * 1024
         && request.resource.metadata.uploader == request.auth.uid;
