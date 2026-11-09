@@ -67,7 +67,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUg==", "base64");
 
 test("group member can upload bounded image with uploader metadata", async () => {
   await seedGroup();
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   const storage = alice.storage(BUCKET);
   const uploader = storage.ref(`groups/${GROUP}/memories/pic1.png`);
   await assertSucceeds(
@@ -79,7 +79,7 @@ test("group member can upload bounded image with uploader metadata", async () =>
 });
 
 test("outsider cannot upload to the group's media area", async () => {
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   const storage = mallory.storage(BUCKET);
   const uploader = storage.ref(`groups/${GROUP}/memories/evil.png`);
   await assertFails(
@@ -91,7 +91,7 @@ test("outsider cannot upload to the group's media area", async () => {
 });
 
 test("member cannot upload claiming an uploader they are not", async () => {
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  const bob = env.authenticatedContext("bob");
   const storage = bob.storage(BUCKET);
   const uploader = storage.ref(`groups/${GROUP}/memories/impostor.png`);
   await assertFails(
@@ -104,14 +104,21 @@ test("member cannot upload claiming an uploader they are not", async () => {
 
 test("member can read group media", async () => {
   await seedGroup();
-  const bob = env.authenticatedContext("bob", { uid: "bob" });
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const storage = ctx.storage(BUCKET);
+    await storage.ref(`groups/${GROUP}/memories/pic1.png`).put(PNG, {
+      contentType: "image/png",
+      customMetadata: { uploader: "alice" },
+    });
+  });
+  const bob = env.authenticatedContext("bob");
   const storage = bob.storage(BUCKET);
   const reader = storage.ref(`groups/${GROUP}/memories/pic1.png`);
   await assertSucceeds(reader.getDownloadURL());
 });
 
 test("outsider cannot read group media", async () => {
-  const mallory = env.authenticatedContext("mallory", { uid: "mallory" });
+  const mallory = env.authenticatedContext("mallory");
   const storage = mallory.storage(BUCKET);
   const reader = storage.ref(`groups/${GROUP}/memories/pic1.png`);
   await assertFails(reader.getDownloadURL());
@@ -127,7 +134,7 @@ test("any group member can delete shared media", async () => {
       customMetadata: { uploader: "bob" },
     });
   });
-  const alice = env.authenticatedContext("alice", { uid: "alice" });
+  const alice = env.authenticatedContext("alice");
   const storage = alice.storage(BUCKET);
   await assertSucceeds(storage.ref(`groups/${GROUP}/memories/bybob.png`).delete());
 });
