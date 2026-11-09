@@ -12,5 +12,8 @@
   },
   "dependencies": {
     "firebase-tools": "^15.28.1"
+  },
+  "overrides": {
+    "undici@^6": "6.29.1"
   }
 }
