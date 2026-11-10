@@ -2,13 +2,13 @@
   "name": "twofold-rules-tests",
   "private": true,
   "version": "1.0.0",
-  "description": "Firestore + Storage emulator rule tests. Isolated from the app so it can pin firebase v10.",
+  "description": "Firestore + Storage emulator rule tests. Isolated from the app; pins firebase v12 to match the app.",
   "scripts": {
     "test": "node --test --test-concurrency=1 *.test.js"
   },
   "devDependencies": {
-    "@firebase/rules-unit-testing": "3.0.4",
-    "firebase": "10.14.1"
+    "@firebase/rules-unit-testing": "5.0.2",
+    "firebase": "12.19.0"
   },
   "dependencies": {
     "firebase-tools": "^15.35.0"
